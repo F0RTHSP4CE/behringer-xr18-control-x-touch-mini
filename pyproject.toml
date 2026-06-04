@@ -1,0 +1,10 @@
+[project]
+name = "behringer-xr18-control-x-touch-mini"
+version = "0.1.0"
+description = "daemon to control xr18 with x-touch mini"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mido>=1.3.3",
+    "python-rtmidi>=1.5.8",
+]
