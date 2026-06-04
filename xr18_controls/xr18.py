@@ -16,6 +16,9 @@ class XR18Listener(Protocol):
     def on_main_fader(self, value: int) -> None:
         ...
 
+    def on_dca_fader(self, dca: int, value: int) -> None:
+        ...
+
     def on_main_mute(self, muted: bool) -> None:
         ...
 
@@ -67,6 +70,12 @@ class MidoXR18Client:
 
     def send(self, message: mido.Message) -> None:
         self._output.send(message)
+
+    def send_xosc(self, text: str) -> None:
+        self.send(build_xosc_message(text))
+
+    def build_xosc(self, text: str) -> mido.Message:
+        return build_xosc_message(text)
 
     def set_channel_fader(self, channel: int, value: int) -> None:
         self.send(mido.Message("control_change", channel=0, control=_channel_control(channel), value=_clamp(value)))
@@ -135,6 +144,8 @@ class XR18MessageRouter:
                 self._listener.on_channel_fader(message.control + 1, message.value)
             elif message.control == 31:
                 self._listener.on_main_fader(message.value)
+            elif 32 <= message.control <= 35:
+                self._listener.on_dca_fader(message.control - 31, message.value)
             return
 
         if message.channel == 1:
@@ -142,6 +153,25 @@ class XR18MessageRouter:
                 self._listener.on_channel_mute(message.control + 1, message.value >= 64)
             elif message.control == 31:
                 self._listener.on_main_mute(message.value >= 64)
+
+
+def build_xosc_message(text: str) -> mido.Message:
+    payload = text.encode("ascii")
+    if any(byte > 0x7F for byte in payload):
+        raise ValueError("X-OSC SysEx payload must be 7-bit ASCII")
+    return mido.Message("sysex", data=[*_XOSC_SYSEX_PREFIX, *payload])
+
+
+def parse_xosc_message(message: mido.Message) -> str | None:
+    if message.type != "sysex":
+        return None
+
+    data = tuple(message.data)
+    if data[: len(_XOSC_SYSEX_PREFIX)] != _XOSC_SYSEX_PREFIX:
+        return None
+
+    payload = bytes(data[len(_XOSC_SYSEX_PREFIX) :])
+    return payload.decode("ascii", errors="replace").rstrip("\x00")
 
 
 def _channel_control(channel: int) -> int:
@@ -158,3 +188,6 @@ def _dca_control(dca: int) -> int:
 
 def _clamp(value: int) -> int:
     return max(0, min(127, value))
+
+
+_XOSC_SYSEX_PREFIX = (0x00, 0x20, 0x32, 0x32)

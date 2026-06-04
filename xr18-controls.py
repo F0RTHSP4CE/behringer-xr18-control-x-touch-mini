@@ -22,6 +22,7 @@ from xr18_controls.xr18 import (
     XR18Client,
     XR18MessageRouter,
     XR18Ports,
+    parse_xosc_message,
 )
 
 
@@ -108,6 +109,13 @@ class MixerBridge:
                 self._set_mute_light_locked(channel)
 
     def on_main_fader(self, value: int) -> None:
+        with self._lock:
+            self._state.main_fader = value
+
+    def on_dca_fader(self, dca: int, value: int) -> None:
+        if dca != 4:
+            return
+
         with self._lock:
             self._state.main_fader = value
 
@@ -263,6 +271,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--knob-step", type=int, default=1, help="Fader step per X-Touch knob detent")
     parser.add_argument("--demo", action="store_true", help="Run without XR18 MIDI ports and print mixer actions")
     parser.add_argument("--debug-midi", action="store_true", help="Print raw and routed MIDI input events")
+    parser.add_argument("--probe-xosc", action="store_true", help="Send XR18 X-OSC SysEx queries and print replies")
+    parser.add_argument("--xosc-timeout", type=float, default=2.0, help="Seconds to wait for X-OSC probe replies")
+    parser.add_argument("--xosc-send-delay", type=float, default=0.05, help="Seconds to pause between X-OSC probe sends")
     parser.add_argument("--list-ports", action="store_true", help="List MIDI ports and exit")
     return parser
 
@@ -274,6 +285,69 @@ def _print_ports() -> None:
     print("Output ports:")
     for name in mido.get_output_names():
         print(f"  {name}")
+
+
+def _probe_xosc(args: argparse.Namespace) -> int:
+    input_names = mido.get_input_names()
+    output_names = mido.get_output_names()
+    xr18_input = _pick_port_name(args.xr18, input_names)
+    xr18_output = _pick_port_name(args.xr18, output_names)
+    xr18 = MidoXR18Client(XR18Ports(xr18_input, xr18_output))
+
+    queries = _dedupe(
+        [
+            "/status",
+            "/info",
+            "/xremote",
+            "/ch/01/mix/fader",
+            "/ch/01/mix/on",
+            "/lr/mix/fader",
+            "/dca/4/fader",
+            *[f"/ch/{channel:02d}/mix/fader" for channel in range(1, 17)],
+            *[f"/ch/{channel:02d}/mix/on" for channel in range(1, 17)],
+            "/lr/mix/fader",
+            "/lr/mix/on",
+            "/dca/4/fader",
+        ]
+    )
+
+    try:
+        print(f"Connected XR18: {xr18_input} / {xr18_output}")
+        print("Sending X-OSC SysEx queries:")
+        for query in queries:
+            message = xr18.build_xosc(query)
+            print(f"  -> {query}    sysex={_message_hex(message)}")
+            xr18.send(message)
+            if args.xosc_send_delay > 0:
+                time.sleep(args.xosc_send_delay)
+
+        deadline = time.monotonic() + args.xosc_timeout
+        replies = 0
+        other_messages = 0
+        print("Waiting for replies...")
+        while time.monotonic() < deadline:
+            had_message = False
+            for message in xr18.input_port.iter_pending():
+                had_message = True
+                text = parse_xosc_message(message)
+                if text is None:
+                    other_messages += 1
+                    print(f"  <- {message}    bytes={_message_hex(message)}")
+                else:
+                    replies += 1
+                    print(f"  <- X-OSC {text}    bytes={_message_hex(message)}")
+            if not had_message:
+                time.sleep(0.01)
+
+        print(f"Received {replies} X-OSC replies.")
+        if replies == 0:
+            print("No X-OSC SysEx replies.")
+            if other_messages:
+                print(f"Received {other_messages} non-X-OSC MIDI messages, so XR18 MIDI TX is working.")
+            print("This XR18 path appears to support normal MIDI feedback, but not X-OSC query replies.")
+        return 0
+    finally:
+        xr18.close()
 
 
 def _open_runtime(args: argparse.Namespace) -> AppRuntime:
@@ -338,6 +412,11 @@ def main() -> int:
         _print_ports()
         return 0
 
+    if args.probe_xosc:
+        if args.demo:
+            parser.error("--probe-xosc needs real XR18 MIDI ports; omit --demo")
+        return _probe_xosc(args)
+
     runtime = _open_runtime(args)
     try:
         runtime.bridge.start()
@@ -355,6 +434,14 @@ def main() -> int:
 
 def _clamp(value: int) -> int:
     return max(0, min(127, value))
+
+
+def _dedupe(values: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _message_hex(message: mido.Message) -> str:
+    return " ".join(f"{byte:02X}" for byte in message.bytes())
 
 
 def _debug_log(source: str, message: str) -> None:

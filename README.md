@@ -25,3 +25,13 @@ uv run xr18-controls.py --demo --debug-midi
 ```
 
 If a press has no `xtouch-midi: raw ...` line, the event did not reach the script. If it has a raw line but no `xtouch-router: button=...` line, the mapping needs fixing.
+
+## probe XR18 X-OSC over MIDI
+
+Use this to check whether the XR18 replies to OSC-over-SysEx queries on its MIDI port:
+
+```
+uv run xr18-controls.py --probe-xosc
+```
+
+If replies appear as `X-OSC ...`, startup sync can be built from those values. Normal `control_change` replies mean MIDI feedback is working, but they are not X-OSC query replies.
