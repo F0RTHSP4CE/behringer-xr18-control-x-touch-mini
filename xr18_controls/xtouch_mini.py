@@ -58,7 +58,15 @@ class MidoXTouchMiniClient:
 
     def __init__(self, ports: XTouchMiniPorts):
         self._input = mido.open_input(ports.input_name)
-        self._output = mido.open_output(ports.output_name)
+        try:
+            self._output = mido.open_output(ports.output_name)
+        except Exception:
+            self._input.close()
+            raise
+
+    @property
+    def input_port(self) -> mido.ports.BaseInput:
+        return self._input
 
     def close(self) -> None:
         self._input.close()

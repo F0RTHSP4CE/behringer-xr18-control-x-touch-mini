@@ -8,8 +8,20 @@ from typing import Iterable
 
 import mido
 
-from xr18_controls.xtouch_mini import Layer, MidoXTouchMiniClient, XTouchMiniMessageRouter, XTouchMiniPorts
-from xr18_controls.xr18 import MidoXR18Client, XR18MessageRouter, XR18Ports
+from xr18_controls.xtouch_mini import (
+    Layer,
+    MidoXTouchMiniClient,
+    XTouchMiniClient,
+    XTouchMiniMessageRouter,
+    XTouchMiniPorts,
+)
+from xr18_controls.xr18 import (
+    DemoXR18Client,
+    MidoXR18Client,
+    XR18Client,
+    XR18MessageRouter,
+    XR18Ports,
+)
 
 
 @dataclass
@@ -30,7 +42,7 @@ class AppState:
 
 
 class MixerBridge:
-    def __init__(self, xtouch: MidoXTouchMiniClient, xr18: MidoXR18Client, knob_step: int = 1):
+    def __init__(self, xtouch: XTouchMiniClient, xr18: XR18Client, knob_step: int = 1):
         self._xtouch = xtouch
         self._xr18 = xr18
         self._state = AppState(knob_step=knob_step)
@@ -86,10 +98,13 @@ class MixerBridge:
 
     def on_channel_mute(self, channel: int, muted: bool) -> None:
         with self._lock:
-            self._state.channels[channel].requested_mute = muted
-            self._state.channels[channel].applied_mute = muted
+            state = self._state.channels[channel]
+            solo_channels = self._solo_channels_locked()
+            if not solo_channels or channel in solo_channels or not muted:
+                state.requested_mute = muted
+            state.applied_mute = muted
             if self._channel_is_visible_locked(channel):
-                self._xtouch.set_button_light(self._visible_button(channel), muted)
+                self._xtouch.set_button_light(self._mute_button(channel), muted)
 
     def on_main_fader(self, value: int) -> None:
         with self._lock:
@@ -104,7 +119,7 @@ class MixerBridge:
         state.requested_mute = not state.requested_mute
         self._sync_channel_mute_locked(channel)
         if self._channel_is_visible_locked(channel):
-            self._xtouch.set_button_light(self._visible_button(channel), state.applied_mute)
+            self._xtouch.set_button_light(self._mute_button(channel), state.applied_mute)
 
     def _toggle_solo_locked(self, channel: int) -> None:
         state = self._state.channels[channel]
@@ -113,20 +128,20 @@ class MixerBridge:
         self._refresh_visible_bank_locked()
 
     def _apply_solo_locked(self) -> None:
-        solo_channels = {channel for channel, state in self._state.channels.items() if state.solo}
-        for channel, state in self._state.channels.items():
-            desired = state.requested_mute or (bool(solo_channels) and channel not in solo_channels)
-            if state.applied_mute != desired:
-                state.applied_mute = desired
-                self._xr18.set_channel_mute(channel, desired)
+        solo_channels = self._solo_channels_locked()
+        for channel in self._state.channels:
+            self._sync_channel_mute_locked(channel, solo_channels)
 
-    def _sync_channel_mute_locked(self, channel: int) -> None:
+    def _sync_channel_mute_locked(self, channel: int, solo_channels: set[int] | None = None) -> None:
         state = self._state.channels[channel]
-        solo_channels = {index for index, current in self._state.channels.items() if current.solo}
+        solo_channels = self._solo_channels_locked() if solo_channels is None else solo_channels
         desired = state.requested_mute or (bool(solo_channels) and channel not in solo_channels)
         if state.applied_mute != desired:
             state.applied_mute = desired
             self._xr18.set_channel_mute(channel, desired)
+
+    def _solo_channels_locked(self) -> set[int]:
+        return {channel for channel, state in self._state.channels.items() if state.solo}
 
     def _sync_main_locked(self) -> None:
         self._xr18.set_main_fader(self._state.main_fader)
@@ -137,7 +152,7 @@ class MixerBridge:
         self._xtouch.set_layer_light(Layer.B, self._state.active_layer == Layer.B)
 
     def _refresh_visible_bank_locked(self) -> None:
-        start = 1 if self._state.active_layer == Layer.A else 9
+        start = self._active_bank_start_locked()
         for knob in range(1, 9):
             channel = start + knob - 1
             self._refresh_knob_locked(knob, channel)
@@ -151,23 +166,26 @@ class MixerBridge:
     def _channel_for_knob_locked(self, knob: int) -> int:
         if not 1 <= knob <= 8:
             raise ValueError(f"knob must be 1..8, got {knob}")
-        return (1 if self._state.active_layer == Layer.A else 9) + knob - 1
+        return self._active_bank_start_locked() + knob - 1
 
     def _channel_for_button_locked(self, button: int) -> int:
-        if not 1 <= button <= 8:
-            raise ValueError(f"button must be 1..8, got {button}")
-        return (1 if self._state.active_layer == Layer.A else 9) + button - 1
+        if not 1 <= button <= 16:
+            raise ValueError(f"button must be 1..16, got {button}")
+        bank_button = button if button <= 8 else button - 8
+        return self._active_bank_start_locked() + bank_button - 1
 
     def _channel_is_visible_locked(self, channel: int) -> bool:
-        start = 1 if self._state.active_layer == Layer.A else 9
+        start = self._active_bank_start_locked()
         return start <= channel <= start + 7
 
     def _visible_knob(self, channel: int) -> int:
-        start = 1 if self._state.active_layer == Layer.A else 9
-        return channel - start + 1
+        return channel - self._active_bank_start_locked() + 1
 
-    def _visible_button(self, channel: int) -> int:
-        return self._visible_knob(channel)
+    def _mute_button(self, channel: int) -> int:
+        return self._visible_knob(channel) + 8
+
+    def _active_bank_start_locked(self) -> int:
+        return 1 if self._state.active_layer == Layer.A else 9
 
 
 class _InputThread(threading.Thread):
@@ -190,6 +208,28 @@ class _InputThread(threading.Thread):
         self._stop_event.set()
 
 
+@dataclass
+class AppRuntime:
+    bridge: MixerBridge
+    xtouch: MidoXTouchMiniClient
+    xr18: XR18Client
+    threads: list[_InputThread]
+    status_messages: list[str]
+
+    def start_threads(self) -> None:
+        for thread in self.threads:
+            thread.start()
+
+    def close(self) -> None:
+        for thread in self.threads:
+            thread.stop()
+        for thread in self.threads:
+            if thread.ident is not None:
+                thread.join(timeout=1)
+        self.xtouch.close()
+        self.xr18.close()
+
+
 def _pick_port_name(requested: str, available: Iterable[str]) -> str:
     available_list = list(available)
     exact = [name for name in available_list if name == requested]
@@ -209,8 +249,63 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xtouch", default="X-TOUCH MINI", help="X-Touch Mini port name or substring")
     parser.add_argument("--xr18", default="XR18", help="XR18 port name or substring")
     parser.add_argument("--knob-step", type=int, default=1, help="Fader step per X-Touch knob detent")
+    parser.add_argument("--demo", action="store_true", help="Run without XR18 MIDI ports and print mixer actions")
     parser.add_argument("--list-ports", action="store_true", help="List MIDI ports and exit")
     return parser
+
+
+def _print_ports() -> None:
+    print("Input ports:")
+    for name in mido.get_input_names():
+        print(f"  {name}")
+    print("Output ports:")
+    for name in mido.get_output_names():
+        print(f"  {name}")
+
+
+def _open_runtime(args: argparse.Namespace) -> AppRuntime:
+    input_names = mido.get_input_names()
+    output_names = mido.get_output_names()
+
+    xtouch_input = _pick_port_name(args.xtouch, input_names)
+    xtouch_output = _pick_port_name(args.xtouch, output_names)
+    xtouch = MidoXTouchMiniClient(XTouchMiniPorts(xtouch_input, xtouch_output))
+
+    xr18: XR18Client | None = None
+    mido_xr18: MidoXR18Client | None = None
+    try:
+        if args.demo:
+            xr18 = DemoXR18Client()
+            xr18_status = "XR18 demo mode: no mixer MIDI ports opened."
+        else:
+            xr18_input = _pick_port_name(args.xr18, input_names)
+            xr18_output = _pick_port_name(args.xr18, output_names)
+            mido_xr18 = MidoXR18Client(XR18Ports(xr18_input, xr18_output))
+            xr18 = mido_xr18
+            xr18_status = f"Connected XR18: {xr18_input} / {xr18_output}"
+
+        assert xr18 is not None
+        bridge = MixerBridge(xtouch, xr18, knob_step=args.knob_step)
+        threads = [_InputThread(xtouch.input_port, XTouchMiniMessageRouter(bridge), name="xtouch-midi")]
+
+        if mido_xr18 is not None:
+            threads.append(_InputThread(mido_xr18.input_port, XR18MessageRouter(bridge), name="xr18-midi"))
+
+        return AppRuntime(
+            bridge=bridge,
+            xtouch=xtouch,
+            xr18=xr18,
+            threads=threads,
+            status_messages=[
+                f"Connected X-Touch Mini: {xtouch_input} / {xtouch_output}",
+                xr18_status,
+            ],
+        )
+    except Exception:
+        xtouch.close()
+        if xr18 is not None:
+            xr18.close()
+        raise
 
 
 def main() -> int:
@@ -218,44 +313,22 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.list_ports:
-        print("Input ports:")
-        for name in mido.get_input_names():
-            print(f"  {name}")
-        print("Output ports:")
-        for name in mido.get_output_names():
-            print(f"  {name}")
+        _print_ports()
         return 0
 
-    xtouch_input = _pick_port_name(args.xtouch, mido.get_input_names())
-    xtouch_output = _pick_port_name(args.xtouch, mido.get_output_names())
-    xr18_input = _pick_port_name(args.xr18, mido.get_input_names())
-    xr18_output = _pick_port_name(args.xr18, mido.get_output_names())
-
-    xtouch = MidoXTouchMiniClient(XTouchMiniPorts(xtouch_input, xtouch_output))
-    xr18 = MidoXR18Client(XR18Ports(xr18_input, xr18_output))
-    bridge = MixerBridge(xtouch, xr18, knob_step=args.knob_step)
-
-    xtouch_router = XTouchMiniMessageRouter(bridge)
-    xr18_router = XR18MessageRouter(bridge)
-    xtouch_thread = _InputThread(xtouch._input, xtouch_router, name="xtouch-midi")
-    xr18_thread = _InputThread(xr18._input, xr18_router, name="xr18-midi")
-
+    runtime = _open_runtime(args)
     try:
-        bridge.start()
-        xtouch_thread.start()
-        xr18_thread.start()
-        print(f"Connected X-Touch Mini: {xtouch_input} / {xtouch_output}")
-        print(f"Connected XR18: {xr18_input} / {xr18_output}")
+        runtime.bridge.start()
+        runtime.start_threads()
+        for message in runtime.status_messages:
+            print(message)
         print("Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         return 0
     finally:
-        xtouch_thread.stop()
-        xr18_thread.stop()
-        xtouch.close()
-        xr18.close()
+        runtime.close()
 
 
 def _clamp(value: int) -> int:

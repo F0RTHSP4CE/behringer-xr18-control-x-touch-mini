@@ -10,6 +10,7 @@ uv run xr18-controls.py
 ```
 
 ## demo mode 
+Demo mode still connects to the X-Touch Mini, but it does not require an XR18 mixer. Mixer actions are stored in memory and printed to the terminal.
 
 ```
 uv run xr18-controls.py --demo

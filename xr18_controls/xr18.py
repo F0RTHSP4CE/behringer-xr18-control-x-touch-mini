@@ -33,6 +33,9 @@ class XR18Client(Protocol):
     def set_main_mute(self, muted: bool) -> None:
         ...
 
+    def close(self) -> None:
+        ...
+
 
 @dataclass(frozen=True)
 class XR18Ports:
@@ -45,7 +48,15 @@ class MidoXR18Client:
 
     def __init__(self, ports: XR18Ports):
         self._input = mido.open_input(ports.input_name)
-        self._output = mido.open_output(ports.output_name)
+        try:
+            self._output = mido.open_output(ports.output_name)
+        except Exception:
+            self._input.close()
+            raise
+
+    @property
+    def input_port(self) -> mido.ports.BaseInput:
+        return self._input
 
     def close(self) -> None:
         self._input.close()
@@ -65,6 +76,36 @@ class MidoXR18Client:
 
     def set_main_mute(self, muted: bool) -> None:
         self.send(mido.Message("control_change", channel=1, control=31, value=127 if muted else 0))
+
+
+class DemoXR18Client:
+    """In-memory XR18 stand-in for developing without a connected mixer."""
+
+    def __init__(self):
+        self.channel_faders = {channel: 0 for channel in range(1, 17)}
+        self.channel_mutes = {channel: False for channel in range(1, 17)}
+        self.main_fader = 0
+        self.main_muted = False
+
+    def close(self) -> None:
+        pass
+
+    def set_channel_fader(self, channel: int, value: int) -> None:
+        clamped = _clamp(value)
+        self.channel_faders[_channel_control(channel) + 1] = clamped
+        print(f"[demo xr18] channel {channel} fader = {clamped}")
+
+    def set_channel_mute(self, channel: int, muted: bool) -> None:
+        self.channel_mutes[_channel_control(channel) + 1] = muted
+        print(f"[demo xr18] channel {channel} mute = {'on' if muted else 'off'}")
+
+    def set_main_fader(self, value: int) -> None:
+        self.main_fader = _clamp(value)
+        print(f"[demo xr18] main fader = {self.main_fader}")
+
+    def set_main_mute(self, muted: bool) -> None:
+        self.main_muted = muted
+        print(f"[demo xr18] main mute = {'on' if muted else 'off'}")
 
 
 class XR18MessageRouter:

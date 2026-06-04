@@ -1,0 +1,17 @@
+# python
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.pyo
+.mypy_cache/
+.pyre/
+.pytype/
+.pyright/
+venv/
+ENV/
+env/
+dist/
+build/
+*.egg-info/
