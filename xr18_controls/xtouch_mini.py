@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Callable, Protocol
 
 import mido
 
@@ -113,31 +113,48 @@ class XTouchMiniMessageRouter:
 
     _master_fader_channel = 8
 
-    def __init__(self, listener: XTouchMiniListener):
+    def __init__(self, listener: XTouchMiniListener, debug: Callable[[str], None] | None = None):
         self._listener = listener
+        self._debug = debug
 
     def handle(self, message: mido.Message) -> None:
         if message.type == "control_change" and message.channel == 0 and 0x10 <= message.control <= 0x17:
-            self._listener.on_knob_turn(message.control - 0x0F, _signed_knob_delta(message.value))
+            knob = message.control - 0x0F
+            delta = _signed_knob_delta(message.value)
+            self._log(f"knob={knob} delta={delta}")
+            self._listener.on_knob_turn(knob, delta)
             return
 
         if message.type == "pitchwheel" and message.channel == self._master_fader_channel:
-            self._listener.on_fader(_pitchwheel_to_fader(message.pitch))
+            value = _pitchwheel_to_fader(message.pitch)
+            self._log(f"master_fader={value}")
+            self._listener.on_fader(value)
             return
 
         if message.type not in {"note_on", "note_off"}:
+            self._log(f"ignored {message}")
             return
 
         down = message.type == "note_on" and message.velocity > 0
         note = message.note
 
         if note in {0x54, 0x55}:
-            self._listener.on_layer(Layer.A if note == 0x54 else Layer.B, down)
+            layer = Layer.A if note == 0x54 else Layer.B
+            self._log(f"layer={layer.value} down={down}")
+            self._listener.on_layer(layer, down)
             return
 
         button = _note_to_button(note)
         if button is not None:
+            self._log(f"button={button} down={down}")
             self._listener.on_button(button, down)
+            return
+
+        self._log(f"unmapped_note={note} down={down}")
+
+    def _log(self, message: str) -> None:
+        if self._debug is not None:
+            self._debug(message)
 
 
 def _signed_knob_delta(value: int) -> int:

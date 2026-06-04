@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -193,10 +194,11 @@ class MixerBridge:
 
 
 class _InputThread(threading.Thread):
-    def __init__(self, port: mido.ports.BaseInput, router, name: str):
+    def __init__(self, port: mido.ports.BaseInput, router, name: str, debug: bool = False):
         super().__init__(name=name, daemon=True)
         self._port = port
         self._router = router
+        self._debug = debug
         self._stop_event = threading.Event()
 
     def run(self) -> None:
@@ -204,7 +206,13 @@ class _InputThread(threading.Thread):
             had_message = False
             for message in self._port.iter_pending():
                 had_message = True
-                self._router.handle(message)
+                if self._debug:
+                    _debug_log(self.name, f"raw {message}")
+                try:
+                    self._router.handle(message)
+                except Exception as error:
+                    _debug_log(self.name, f"router error for {message}: {error!r}")
+                    raise
             if not had_message:
                 time.sleep(0.01)
 
@@ -254,6 +262,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xr18", default="XR18", help="XR18 port name or substring")
     parser.add_argument("--knob-step", type=int, default=1, help="Fader step per X-Touch knob detent")
     parser.add_argument("--demo", action="store_true", help="Run without XR18 MIDI ports and print mixer actions")
+    parser.add_argument("--debug-midi", action="store_true", help="Print raw and routed MIDI input events")
     parser.add_argument("--list-ports", action="store_true", help="List MIDI ports and exit")
     return parser
 
@@ -290,10 +299,19 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
 
         assert xr18 is not None
         bridge = MixerBridge(xtouch, xr18, knob_step=args.knob_step)
-        threads = [_InputThread(xtouch.input_port, XTouchMiniMessageRouter(bridge), name="xtouch-midi")]
+        xtouch_debug = (lambda message: _debug_log("xtouch-router", message)) if args.debug_midi else None
+        xtouch_router = XTouchMiniMessageRouter(bridge, debug=xtouch_debug)
+        threads = [_InputThread(xtouch.input_port, xtouch_router, name="xtouch-midi", debug=args.debug_midi)]
 
         if mido_xr18 is not None:
-            threads.append(_InputThread(mido_xr18.input_port, XR18MessageRouter(bridge), name="xr18-midi"))
+            threads.append(
+                _InputThread(
+                    mido_xr18.input_port,
+                    XR18MessageRouter(bridge),
+                    name="xr18-midi",
+                    debug=args.debug_midi,
+                )
+            )
 
         return AppRuntime(
             bridge=bridge,
@@ -337,6 +355,10 @@ def main() -> int:
 
 def _clamp(value: int) -> int:
     return max(0, min(127, value))
+
+
+def _debug_log(source: str, message: str) -> None:
+    print(f"[{time.monotonic():.6f}] {source}: {message}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

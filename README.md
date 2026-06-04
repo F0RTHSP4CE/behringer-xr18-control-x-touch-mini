@@ -15,3 +15,13 @@ Demo mode still connects to the X-Touch Mini, but it does not require an XR18 mi
 ```
 uv run xr18-controls.py --demo
 ```
+
+## debug MIDI input
+
+Use debug mode when a button or fader seems unreliable:
+
+```
+uv run xr18-controls.py --demo --debug-midi
+```
+
+If a press has no `xtouch-midi: raw ...` line, the event did not reach the script. If it has a raw line but no `xtouch-router: button=...` line, the mapping needs fixing.
