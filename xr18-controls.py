@@ -28,6 +28,7 @@ from xr18_controls.xr18 import (
 @dataclass
 class ChannelState:
     fader: int = 0
+    pan: int = 64
     requested_mute: bool = False
     applied_mute: bool = False
 
@@ -36,6 +37,8 @@ class ChannelState:
 class AppState:
     active_layer: Layer = Layer.A
     channels: dict[int, ChannelState] = field(default_factory=lambda: {index: ChannelState() for index in range(1, 17)})
+    pan_knobs: set[int] = field(default_factory=set)
+    last_knob_taps: dict[int, tuple[int, float]] = field(default_factory=dict)
     main_fader: int = 0
     dca4_fader: int = 0
     main_muted: bool = False
@@ -69,6 +72,8 @@ class FeedbackEchoFilter:
 
 
 class MixerBridge:
+    _double_tap_timeout = 0.15
+
     def __init__(self, xtouch: XTouchMiniClient, xr18: XR18Client, knob_step: int = 1):
         self._xtouch = xtouch
         self._xr18 = xr18
@@ -89,9 +94,28 @@ class MixerBridge:
         with self._lock:
             channel = self._channel_for_knob_locked(knob)
             state = self._state.channels[channel]
+            if knob in self._state.pan_knobs:
+                state.pan = _clamp_pan(state.pan + delta * self._state.knob_step)
+                self._xr18.set_channel_pan(channel, state.pan)
+                self._refresh_pan_locked(knob, channel)
+                return
+
             state.fader = _clamp(state.fader + delta * self._state.knob_step)
             self._xr18.set_channel_fader(channel, state.fader)
             self._refresh_knob_locked(knob, channel)
+
+    def on_knob_press(self, knob: int, down: bool) -> None:
+        with self._lock:
+            channel = self._channel_for_knob_locked(knob)
+            if down:
+                self._state.pan_knobs.add(knob)
+                if self._consume_double_tap_locked(knob, channel):
+                    self._center_pan_locked(knob, channel)
+                self._refresh_pan_locked(knob, channel)
+            else:
+                self._state.pan_knobs.discard(knob)
+                self._state.last_knob_taps[knob] = (channel, time.monotonic())
+                self._refresh_knob_locked(knob, channel)
 
     def on_button(self, button: int, down: bool) -> None:
         if not down:
@@ -130,6 +154,14 @@ class MixerBridge:
             state.applied_mute = muted
             if self._channel_is_visible_locked(channel):
                 self._set_mute_light_locked(channel)
+
+    def on_channel_pan(self, channel: int, value: int) -> None:
+        with self._lock:
+            self._state.channels[channel].pan = _clamp_pan(value)
+            if self._channel_is_visible_locked(channel):
+                knob = self._visible_knob(channel)
+                if knob in self._state.pan_knobs:
+                    self._refresh_pan_locked(knob, channel)
 
     def on_main_fader(self, value: int) -> None:
         with self._lock:
@@ -174,6 +206,20 @@ class MixerBridge:
             state.applied_mute = desired
             self._xr18.set_channel_mute(channel, desired)
 
+    def _consume_double_tap_locked(self, knob: int, channel: int) -> bool:
+        previous = self._state.last_knob_taps.pop(knob, None)
+        if previous is None:
+            return False
+
+        previous_channel, timestamp = previous
+        return previous_channel == channel and time.monotonic() - timestamp <= self._double_tap_timeout
+
+    def _center_pan_locked(self, knob: int, channel: int) -> None:
+        state = self._state.channels[channel]
+        state.pan = 64
+        self._xr18.set_channel_pan(channel, state.pan)
+        self._refresh_pan_locked(knob, channel)
+
     def _sync_main_locked(self) -> None:
         self._send_main_fader_locked(self._state.main_fader)
         self._state.dca4_fader = self._state.main_fader
@@ -198,13 +244,20 @@ class MixerBridge:
         start = self._active_bank_start_locked()
         for knob in range(1, 9):
             channel = start + knob - 1
-            self._refresh_knob_locked(knob, channel)
+            if knob in self._state.pan_knobs:
+                self._refresh_pan_locked(knob, channel)
+            else:
+                self._refresh_knob_locked(knob, channel)
             self._set_mute_light_locked(channel)
             self._xtouch.set_button_light(knob + 8, False)
 
     def _refresh_knob_locked(self, knob: int, channel: int) -> None:
         level = round(self._state.channels[channel].fader * 11 / 127)
         self._xtouch.set_knob_ring(knob, level)
+
+    def _refresh_pan_locked(self, knob: int, channel: int) -> None:
+        level = round((self._state.channels[channel].pan - 1) * 10 / 126) + 1
+        self._xtouch.set_knob_pan_ring(knob, level)
 
     def _channel_for_knob_locked(self, knob: int) -> int:
         if not 1 <= knob <= 8:
@@ -396,6 +449,10 @@ def main() -> int:
 
 def _clamp(value: int) -> int:
     return max(0, min(127, value))
+
+
+def _clamp_pan(value: int) -> int:
+    return max(1, min(127, value))
 
 
 def _debug_log(source: str, message: str) -> None:

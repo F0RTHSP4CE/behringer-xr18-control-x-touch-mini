@@ -13,6 +13,9 @@ class XR18Listener(Protocol):
     def on_channel_mute(self, channel: int, muted: bool) -> None:
         ...
 
+    def on_channel_pan(self, channel: int, value: int) -> None:
+        ...
+
     def on_main_fader(self, value: int) -> None:
         ...
 
@@ -28,6 +31,9 @@ class XR18Client(Protocol):
         ...
 
     def set_channel_mute(self, channel: int, muted: bool) -> None:
+        ...
+
+    def set_channel_pan(self, channel: int, value: int) -> None:
         ...
 
     def set_main_fader(self, value: int) -> None:
@@ -77,6 +83,9 @@ class MidoXR18Client:
     def set_channel_mute(self, channel: int, muted: bool) -> None:
         self.send(mido.Message("control_change", channel=1, control=_channel_control(channel), value=127 if muted else 0))
 
+    def set_channel_pan(self, channel: int, value: int) -> None:
+        self.send(mido.Message("control_change", channel=2, control=_channel_control(channel), value=_clamp_pan(value)))
+
     def set_main_fader(self, value: int) -> None:
         self.send(mido.Message("control_change", channel=0, control=31, value=_clamp(value)))
 
@@ -93,6 +102,7 @@ class DemoXR18Client:
     def __init__(self):
         self.channel_faders = {channel: 0 for channel in range(1, 17)}
         self.channel_mutes = {channel: False for channel in range(1, 17)}
+        self.channel_pans = {channel: 64 for channel in range(1, 17)}
         self.dca_faders = {dca: 0 for dca in range(1, 5)}
         self.main_fader = 0
         self.main_muted = False
@@ -108,6 +118,11 @@ class DemoXR18Client:
     def set_channel_mute(self, channel: int, muted: bool) -> None:
         self.channel_mutes[_channel_control(channel) + 1] = muted
         print(f"[demo xr18] channel {channel} mute = {'on' if muted else 'off'}")
+
+    def set_channel_pan(self, channel: int, value: int) -> None:
+        clamped = _clamp_pan(value)
+        self.channel_pans[_channel_control(channel) + 1] = clamped
+        print(f"[demo xr18] channel {channel} pan = {clamped}")
 
     def set_main_fader(self, value: int) -> None:
         self.main_fader = _clamp(value)
@@ -147,6 +162,11 @@ class XR18MessageRouter:
                 self._listener.on_channel_mute(message.control + 1, message.value >= 64)
             elif message.control == 31:
                 self._listener.on_main_mute(message.value >= 64)
+            return
+
+        if message.channel == 2:
+            if 0 <= message.control <= 15:
+                self._listener.on_channel_pan(message.control + 1, message.value)
 
 
 def _channel_control(channel: int) -> int:
@@ -163,3 +183,7 @@ def _dca_control(dca: int) -> int:
 
 def _clamp(value: int) -> int:
     return max(0, min(127, value))
+
+
+def _clamp_pan(value: int) -> int:
+    return max(1, min(127, value))

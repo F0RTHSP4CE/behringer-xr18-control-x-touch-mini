@@ -16,6 +16,9 @@ class XTouchMiniListener(Protocol):
     def on_knob_turn(self, knob: int, delta: int) -> None:
         ...
 
+    def on_knob_press(self, knob: int, down: bool) -> None:
+        ...
+
     def on_button(self, button: int, down: bool) -> None:
         ...
 
@@ -37,6 +40,9 @@ class XTouchMiniClient(Protocol):
         ...
 
     def set_knob_ring(self, knob: int, level: int) -> None:
+        ...
+
+    def set_knob_pan_ring(self, knob: int, level: int) -> None:
         ...
 
     def reset(self) -> None:
@@ -93,6 +99,12 @@ class MidoXTouchMiniClient:
         clamped = max(0, min(level, 11))
         self.send(mido.Message("control_change", channel=0, control=0x2F + knob, value=clamped + 32))
 
+    def set_knob_pan_ring(self, knob: int, level: int) -> None:
+        if not 1 <= knob <= 8:
+            raise ValueError(f"knob must be 1..8, got {knob}")
+        clamped = max(1, min(level, 11))
+        self.send(mido.Message("control_change", channel=0, control=0x2F + knob, value=clamped))
+
     def reset(self) -> None:
         for knob in range(1, 9):
             self.set_knob_ring(knob, 0)
@@ -144,6 +156,12 @@ class XTouchMiniMessageRouter:
             self._listener.on_layer(layer, down)
             return
 
+        knob = _note_to_knob_press(note)
+        if knob is not None:
+            self._log(f"knob_press={knob} down={down}")
+            self._listener.on_knob_press(knob, down)
+            return
+
         button = _note_to_button(note)
         if button is not None:
             self._log(f"button={button} down={down}")
@@ -172,4 +190,11 @@ def _note_to_button(note: int) -> int | None:
         return top_notes.index(note) + 1
     if note in bottom_notes:
         return bottom_notes.index(note) + 9
+    return None
+
+
+def _note_to_knob_press(note: int) -> int | None:
+    vpot_notes = range(0x20, 0x28)
+    if note in vpot_notes:
+        return note - 0x1F
     return None
