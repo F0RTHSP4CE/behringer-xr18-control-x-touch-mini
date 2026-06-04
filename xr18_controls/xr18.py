@@ -16,6 +16,9 @@ class XR18Listener(Protocol):
     def on_main_fader(self, value: int) -> None:
         ...
 
+    def on_dca_fader(self, dca: int, value: int) -> None:
+        ...
+
     def on_main_mute(self, muted: bool) -> None:
         ...
 
@@ -135,6 +138,8 @@ class XR18MessageRouter:
                 self._listener.on_channel_fader(message.control + 1, message.value)
             elif message.control == 31:
                 self._listener.on_main_fader(message.value)
+            elif 32 <= message.control <= 35:
+                self._listener.on_dca_fader(message.control - 31, message.value)
             return
 
         if message.channel == 1:

@@ -30,7 +30,6 @@ class ChannelState:
     fader: int = 0
     requested_mute: bool = False
     applied_mute: bool = False
-    solo: bool = False
 
 
 @dataclass
@@ -38,8 +37,35 @@ class AppState:
     active_layer: Layer = Layer.A
     channels: dict[int, ChannelState] = field(default_factory=lambda: {index: ChannelState() for index in range(1, 17)})
     main_fader: int = 0
+    dca4_fader: int = 0
     main_muted: bool = False
     knob_step: int = 1
+
+
+class FeedbackEchoFilter:
+    def __init__(self, timeout: float = 1.0):
+        self._timeout = timeout
+        self._pending: list[tuple[int, float]] = []
+
+    def remember(self, value: int) -> None:
+        self._trim()
+        self._pending.append((value, time.monotonic()))
+
+    def consume(self, value: int) -> bool:
+        self._trim()
+        for index, (pending_value, _) in enumerate(self._pending):
+            if pending_value == value:
+                self._pending.pop(index)
+                return True
+        return False
+
+    def _trim(self) -> None:
+        cutoff = time.monotonic() - self._timeout
+        expired_count = next(
+            (index for index, (_, timestamp) in enumerate(self._pending) if timestamp >= cutoff),
+            len(self._pending),
+        )
+        del self._pending[:expired_count]
 
 
 class MixerBridge:
@@ -47,6 +73,8 @@ class MixerBridge:
         self._xtouch = xtouch
         self._xr18 = xr18
         self._state = AppState(knob_step=knob_step)
+        self._main_fader_echo = FeedbackEchoFilter()
+        self._dca4_fader_echo = FeedbackEchoFilter()
         self._lock = threading.Lock()
 
     def start(self) -> None:
@@ -70,10 +98,8 @@ class MixerBridge:
             return
 
         with self._lock:
-            channel = self._channel_for_button_locked(button)
             if button <= 8:
-                self._toggle_solo_locked(channel)
-            else:
+                channel = self._channel_for_button_locked(button)
                 self._toggle_mute_locked(channel)
 
     def on_layer(self, layer: Layer, down: bool) -> None:
@@ -100,16 +126,35 @@ class MixerBridge:
     def on_channel_mute(self, channel: int, muted: bool) -> None:
         with self._lock:
             state = self._state.channels[channel]
-            solo_channels = self._solo_channels_locked()
-            if not solo_channels or channel in solo_channels or not muted:
-                state.requested_mute = muted
+            state.requested_mute = muted
             state.applied_mute = muted
             if self._channel_is_visible_locked(channel):
                 self._set_mute_light_locked(channel)
 
     def on_main_fader(self, value: int) -> None:
         with self._lock:
+            if self._main_fader_echo.consume(value):
+                self._state.main_fader = value
+                return
+
             self._state.main_fader = value
+            if self._state.dca4_fader != value:
+                self._state.dca4_fader = value
+                self._send_dca4_fader_locked(value)
+
+    def on_dca_fader(self, dca: int, value: int) -> None:
+        if dca != 4:
+            return
+
+        with self._lock:
+            if self._dca4_fader_echo.consume(value):
+                self._state.dca4_fader = value
+                return
+
+            self._state.dca4_fader = value
+            if self._state.main_fader != value:
+                self._state.main_fader = value
+                self._send_main_fader_locked(value)
 
     def on_main_mute(self, muted: bool) -> None:
         with self._lock:
@@ -122,32 +167,28 @@ class MixerBridge:
         if self._channel_is_visible_locked(channel):
             self._set_mute_light_locked(channel)
 
-    def _toggle_solo_locked(self, channel: int) -> None:
+    def _sync_channel_mute_locked(self, channel: int) -> None:
         state = self._state.channels[channel]
-        state.solo = not state.solo
-        self._apply_solo_locked()
-        self._refresh_visible_bank_locked()
-
-    def _apply_solo_locked(self) -> None:
-        solo_channels = self._solo_channels_locked()
-        for channel in self._state.channels:
-            self._sync_channel_mute_locked(channel, solo_channels)
-
-    def _sync_channel_mute_locked(self, channel: int, solo_channels: set[int] | None = None) -> None:
-        state = self._state.channels[channel]
-        solo_channels = self._solo_channels_locked() if solo_channels is None else solo_channels
-        desired = state.requested_mute or (bool(solo_channels) and channel not in solo_channels)
+        desired = state.requested_mute
         if state.applied_mute != desired:
             state.applied_mute = desired
             self._xr18.set_channel_mute(channel, desired)
 
-    def _solo_channels_locked(self) -> set[int]:
-        return {channel for channel, state in self._state.channels.items() if state.solo}
-
     def _sync_main_locked(self) -> None:
-        self._xr18.set_main_fader(self._state.main_fader)
-        self._xr18.set_dca_fader(4, self._state.main_fader)
+        self._send_main_fader_locked(self._state.main_fader)
+        self._state.dca4_fader = self._state.main_fader
+        self._send_dca4_fader_locked(self._state.main_fader)
         self._xr18.set_main_mute(self._state.main_muted)
+
+    def _send_main_fader_locked(self, value: int) -> None:
+        clamped = _clamp(value)
+        self._main_fader_echo.remember(clamped)
+        self._xr18.set_main_fader(clamped)
+
+    def _send_dca4_fader_locked(self, value: int) -> None:
+        clamped = _clamp(value)
+        self._dca4_fader_echo.remember(clamped)
+        self._xr18.set_dca_fader(4, clamped)
 
     def _refresh_layer_lights_locked(self) -> None:
         self._xtouch.set_layer_light(Layer.A, self._state.active_layer == Layer.A)
@@ -158,8 +199,8 @@ class MixerBridge:
         for knob in range(1, 9):
             channel = start + knob - 1
             self._refresh_knob_locked(knob, channel)
-            self._xtouch.set_button_light(knob, self._state.channels[channel].solo)
             self._set_mute_light_locked(channel)
+            self._xtouch.set_button_light(knob + 8, False)
 
     def _refresh_knob_locked(self, knob: int, channel: int) -> None:
         level = round(self._state.channels[channel].fader * 11 / 127)
@@ -184,7 +225,7 @@ class MixerBridge:
         return channel - self._active_bank_start_locked() + 1
 
     def _mute_button(self, channel: int) -> int:
-        return self._visible_knob(channel) + 8
+        return self._visible_knob(channel)
 
     def _set_mute_light_locked(self, channel: int) -> None:
         self._xtouch.set_button_light(self._mute_button(channel), not self._state.channels[channel].applied_mute)
