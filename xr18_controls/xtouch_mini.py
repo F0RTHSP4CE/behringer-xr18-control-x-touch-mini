@@ -111,6 +111,8 @@ class MidoXTouchMiniClient:
 class XTouchMiniMessageRouter:
     """Parses X-Touch Mini MIDI input and dispatches to a listener."""
 
+    _master_fader_channel = 8
+
     def __init__(self, listener: XTouchMiniListener):
         self._listener = listener
 
@@ -119,7 +121,7 @@ class XTouchMiniMessageRouter:
             self._listener.on_knob_turn(message.control - 0x0F, _signed_knob_delta(message.value))
             return
 
-        if message.type == "pitchwheel" and message.channel == 0:
+        if message.type == "pitchwheel" and message.channel == self._master_fader_channel:
             self._listener.on_fader(_pitchwheel_to_fader(message.pitch))
             return
 

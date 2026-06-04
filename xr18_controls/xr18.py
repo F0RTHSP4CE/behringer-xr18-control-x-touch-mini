@@ -30,6 +30,9 @@ class XR18Client(Protocol):
     def set_main_fader(self, value: int) -> None:
         ...
 
+    def set_dca_fader(self, dca: int, value: int) -> None:
+        ...
+
     def set_main_mute(self, muted: bool) -> None:
         ...
 
@@ -74,6 +77,9 @@ class MidoXR18Client:
     def set_main_fader(self, value: int) -> None:
         self.send(mido.Message("control_change", channel=0, control=31, value=_clamp(value)))
 
+    def set_dca_fader(self, dca: int, value: int) -> None:
+        self.send(mido.Message("control_change", channel=0, control=_dca_control(dca), value=_clamp(value)))
+
     def set_main_mute(self, muted: bool) -> None:
         self.send(mido.Message("control_change", channel=1, control=31, value=127 if muted else 0))
 
@@ -84,6 +90,7 @@ class DemoXR18Client:
     def __init__(self):
         self.channel_faders = {channel: 0 for channel in range(1, 17)}
         self.channel_mutes = {channel: False for channel in range(1, 17)}
+        self.dca_faders = {dca: 0 for dca in range(1, 5)}
         self.main_fader = 0
         self.main_muted = False
 
@@ -102,6 +109,11 @@ class DemoXR18Client:
     def set_main_fader(self, value: int) -> None:
         self.main_fader = _clamp(value)
         print(f"[demo xr18] main fader = {self.main_fader}")
+
+    def set_dca_fader(self, dca: int, value: int) -> None:
+        clamped = _clamp(value)
+        self.dca_faders[_dca_control(dca) - 31] = clamped
+        print(f"[demo xr18] DCA {dca} fader = {clamped}")
 
     def set_main_mute(self, muted: bool) -> None:
         self.main_muted = muted
@@ -136,6 +148,12 @@ def _channel_control(channel: int) -> int:
     if not 1 <= channel <= 16:
         raise ValueError(f"channel must be 1..16, got {channel}")
     return channel - 1
+
+
+def _dca_control(dca: int) -> int:
+    if not 1 <= dca <= 4:
+        raise ValueError(f"dca must be 1..4, got {dca}")
+    return dca + 31
 
 
 def _clamp(value: int) -> int:

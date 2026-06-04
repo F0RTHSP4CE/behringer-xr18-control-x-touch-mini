@@ -104,7 +104,7 @@ class MixerBridge:
                 state.requested_mute = muted
             state.applied_mute = muted
             if self._channel_is_visible_locked(channel):
-                self._xtouch.set_button_light(self._mute_button(channel), muted)
+                self._set_mute_light_locked(channel)
 
     def on_main_fader(self, value: int) -> None:
         with self._lock:
@@ -119,7 +119,7 @@ class MixerBridge:
         state.requested_mute = not state.requested_mute
         self._sync_channel_mute_locked(channel)
         if self._channel_is_visible_locked(channel):
-            self._xtouch.set_button_light(self._mute_button(channel), state.applied_mute)
+            self._set_mute_light_locked(channel)
 
     def _toggle_solo_locked(self, channel: int) -> None:
         state = self._state.channels[channel]
@@ -145,6 +145,7 @@ class MixerBridge:
 
     def _sync_main_locked(self) -> None:
         self._xr18.set_main_fader(self._state.main_fader)
+        self._xr18.set_dca_fader(4, self._state.main_fader)
         self._xr18.set_main_mute(self._state.main_muted)
 
     def _refresh_layer_lights_locked(self) -> None:
@@ -157,7 +158,7 @@ class MixerBridge:
             channel = start + knob - 1
             self._refresh_knob_locked(knob, channel)
             self._xtouch.set_button_light(knob, self._state.channels[channel].solo)
-            self._xtouch.set_button_light(knob + 8, self._state.channels[channel].applied_mute)
+            self._set_mute_light_locked(channel)
 
     def _refresh_knob_locked(self, knob: int, channel: int) -> None:
         level = round(self._state.channels[channel].fader * 11 / 127)
@@ -183,6 +184,9 @@ class MixerBridge:
 
     def _mute_button(self, channel: int) -> int:
         return self._visible_knob(channel) + 8
+
+    def _set_mute_light_locked(self, channel: int) -> None:
+        self._xtouch.set_button_light(self._mute_button(channel), not self._state.channels[channel].applied_mute)
 
     def _active_bank_start_locked(self) -> int:
         return 1 if self._state.active_layer == Layer.A else 9
