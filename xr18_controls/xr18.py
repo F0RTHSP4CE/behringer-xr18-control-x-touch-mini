@@ -16,6 +16,24 @@ class XR18Listener(Protocol):
     def on_channel_pan(self, channel: int, value: int) -> None:
         ...
 
+    def on_aux_fader(self, value: int) -> None:
+        ...
+
+    def on_fx_return_fader(self, fx: int, value: int) -> None:
+        ...
+
+    def on_aux_mute(self, muted: bool) -> None:
+        ...
+
+    def on_fx_return_mute(self, fx: int, muted: bool) -> None:
+        ...
+
+    def on_aux_pan(self, value: int) -> None:
+        ...
+
+    def on_fx_return_pan(self, fx: int, value: int) -> None:
+        ...
+
     def on_main_fader(self, value: int) -> None:
         ...
 
@@ -34,6 +52,24 @@ class XR18Client(Protocol):
         ...
 
     def set_channel_pan(self, channel: int, value: int) -> None:
+        ...
+
+    def set_aux_fader(self, value: int) -> None:
+        ...
+
+    def set_fx_return_fader(self, fx: int, value: int) -> None:
+        ...
+
+    def set_aux_mute(self, muted: bool) -> None:
+        ...
+
+    def set_fx_return_mute(self, fx: int, muted: bool) -> None:
+        ...
+
+    def set_aux_pan(self, value: int) -> None:
+        ...
+
+    def set_fx_return_pan(self, fx: int, value: int) -> None:
         ...
 
     def set_main_fader(self, value: int) -> None:
@@ -86,6 +122,24 @@ class MidoXR18Client:
     def set_channel_pan(self, channel: int, value: int) -> None:
         self.send(mido.Message("control_change", channel=2, control=_channel_control(channel), value=_clamp_pan(value)))
 
+    def set_aux_fader(self, value: int) -> None:
+        self.send(mido.Message("control_change", channel=0, control=16, value=_clamp(value)))
+
+    def set_fx_return_fader(self, fx: int, value: int) -> None:
+        self.send(mido.Message("control_change", channel=0, control=_fx_return_control(fx), value=_clamp(value)))
+
+    def set_aux_mute(self, muted: bool) -> None:
+        self.send(mido.Message("control_change", channel=1, control=16, value=127 if muted else 0))
+
+    def set_fx_return_mute(self, fx: int, muted: bool) -> None:
+        self.send(mido.Message("control_change", channel=1, control=_fx_return_control(fx), value=127 if muted else 0))
+
+    def set_aux_pan(self, value: int) -> None:
+        self.send(mido.Message("control_change", channel=2, control=16, value=_clamp_pan(value)))
+
+    def set_fx_return_pan(self, fx: int, value: int) -> None:
+        self.send(mido.Message("control_change", channel=2, control=_fx_return_control(fx), value=_clamp_pan(value)))
+
     def set_main_fader(self, value: int) -> None:
         self.send(mido.Message("control_change", channel=0, control=31, value=_clamp(value)))
 
@@ -103,6 +157,12 @@ class DemoXR18Client:
         self.channel_faders = {channel: 0 for channel in range(1, 17)}
         self.channel_mutes = {channel: False for channel in range(1, 17)}
         self.channel_pans = {channel: 64 for channel in range(1, 17)}
+        self.fx_return_faders = {fx: 0 for fx in range(1, 5)}
+        self.fx_return_mutes = {fx: False for fx in range(1, 5)}
+        self.fx_return_pans = {fx: 64 for fx in range(1, 5)}
+        self.aux_fader = 0
+        self.aux_muted = False
+        self.aux_pan = 64
         self.dca_faders = {dca: 0 for dca in range(1, 5)}
         self.main_fader = 0
         self.main_muted = False
@@ -123,6 +183,32 @@ class DemoXR18Client:
         clamped = _clamp_pan(value)
         self.channel_pans[_channel_control(channel) + 1] = clamped
         print(f"[demo xr18] channel {channel} pan = {clamped}")
+
+    def set_aux_fader(self, value: int) -> None:
+        self.aux_fader = _clamp(value)
+        print(f"[demo xr18] aux fader = {self.aux_fader}")
+
+    def set_fx_return_fader(self, fx: int, value: int) -> None:
+        clamped = _clamp(value)
+        self.fx_return_faders[_fx_return_control(fx) - 16] = clamped
+        print(f"[demo xr18] FX {fx} return fader = {clamped}")
+
+    def set_aux_mute(self, muted: bool) -> None:
+        self.aux_muted = muted
+        print(f"[demo xr18] aux mute = {'on' if muted else 'off'}")
+
+    def set_fx_return_mute(self, fx: int, muted: bool) -> None:
+        self.fx_return_mutes[_fx_return_control(fx) - 16] = muted
+        print(f"[demo xr18] FX {fx} return mute = {'on' if muted else 'off'}")
+
+    def set_aux_pan(self, value: int) -> None:
+        self.aux_pan = _clamp_pan(value)
+        print(f"[demo xr18] aux pan = {self.aux_pan}")
+
+    def set_fx_return_pan(self, fx: int, value: int) -> None:
+        clamped = _clamp_pan(value)
+        self.fx_return_pans[_fx_return_control(fx) - 16] = clamped
+        print(f"[demo xr18] FX {fx} return pan = {clamped}")
 
     def set_main_fader(self, value: int) -> None:
         self.main_fader = _clamp(value)
@@ -151,6 +237,10 @@ class XR18MessageRouter:
         if message.channel == 0:
             if 0 <= message.control <= 15:
                 self._listener.on_channel_fader(message.control + 1, message.value)
+            elif message.control == 16:
+                self._listener.on_aux_fader(message.value)
+            elif 17 <= message.control <= 20:
+                self._listener.on_fx_return_fader(message.control - 16, message.value)
             elif message.control == 31:
                 self._listener.on_main_fader(message.value)
             elif 32 <= message.control <= 35:
@@ -160,6 +250,10 @@ class XR18MessageRouter:
         if message.channel == 1:
             if 0 <= message.control <= 15:
                 self._listener.on_channel_mute(message.control + 1, message.value >= 64)
+            elif message.control == 16:
+                self._listener.on_aux_mute(message.value >= 64)
+            elif 17 <= message.control <= 20:
+                self._listener.on_fx_return_mute(message.control - 16, message.value >= 64)
             elif message.control == 31:
                 self._listener.on_main_mute(message.value >= 64)
             return
@@ -167,6 +261,10 @@ class XR18MessageRouter:
         if message.channel == 2:
             if 0 <= message.control <= 15:
                 self._listener.on_channel_pan(message.control + 1, message.value)
+            elif message.control == 16:
+                self._listener.on_aux_pan(message.value)
+            elif 17 <= message.control <= 20:
+                self._listener.on_fx_return_pan(message.control - 16, message.value)
 
 
 def _channel_control(channel: int) -> int:
@@ -179,6 +277,12 @@ def _dca_control(dca: int) -> int:
     if not 1 <= dca <= 4:
         raise ValueError(f"dca must be 1..4, got {dca}")
     return dca + 31
+
+
+def _fx_return_control(fx: int) -> int:
+    if not 1 <= fx <= 4:
+        raise ValueError(f"fx must be 1..4, got {fx}")
+    return fx + 16
 
 
 def _clamp(value: int) -> int:
