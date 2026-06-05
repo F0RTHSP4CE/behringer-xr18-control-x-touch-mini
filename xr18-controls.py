@@ -6,10 +6,18 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Protocol
 
 import mido
 
+from xr18_controls.recording import DEFAULT_BLOCKSIZE
+from xr18_controls.recording import DEFAULT_CHANNELS
+from xr18_controls.recording import DEFAULT_SAMPLE_RATE
+from xr18_controls.recording import RecordingConfig
+from xr18_controls.recording import RecordingService
+from xr18_controls.recording import SystemNotifier
+from xr18_controls.recording import list_audio_input_devices
 from xr18_controls.xtouch_mini import (
     Layer,
     MidoXTouchMiniClient,
@@ -40,9 +48,11 @@ SECOND_CHANNEL_PAGE_OFFSET = 8
 METER_RING_STEPS = 11
 PAN_RING_STEPS = 10
 MAIN_DCA = 4
+RECORD_BUTTON = 16
 INPUT_POLL_INTERVAL = 0.01
 RECONNECT_INTERVAL = 1.0
 CONNECTION_CHECK_INTERVAL = 1.0
+RECORD_BUTTON_BLINK_INTERVAL = 0.5
 
 
 def _validate_index(name: str, value: int, count: int) -> None:
@@ -129,6 +139,8 @@ class AppState:
     pan_knobs: set[int] = field(default_factory=set)
     main: MainState = field(default_factory=MainState)
     knob_step: int = 1
+    recording_active: bool = False
+    recording_light_on: bool = False
 
 
 PAGE_DEFINITIONS = {
@@ -213,9 +225,18 @@ class DoubleTapDetector:
 class MixerBridge:
     _double_tap_timeout = 0.15
 
-    def __init__(self, xtouch: XTouchMiniClient, xr18: XR18Client, knob_step: int = 1):
+    def __init__(
+        self,
+        xtouch: XTouchMiniClient,
+        xr18: XR18Client,
+        recording: RecordingService,
+        knob_step: int = 1,
+        debug: Callable[[str], None] | None = None,
+    ):
         self._xtouch = xtouch
         self._xr18 = xr18
+        self._recording = recording
+        self._debug = debug
         self._state = AppState(knob_step=knob_step)
         self._main_fader_echo = FeedbackEchoFilter()
         self._dca4_fader_echo = FeedbackEchoFilter()
@@ -270,6 +291,10 @@ class MixerBridge:
 
     def on_button(self, button: int, down: bool) -> None:
         if not down:
+            return
+
+        if button == RECORD_BUTTON:
+            self._toggle_recording()
             return
 
         with self._lock:
@@ -365,6 +390,44 @@ class MixerBridge:
         with self._lock:
             self._state.main.muted = muted
 
+    def pulse_recording_light(self) -> None:
+        with self._lock:
+            if not self._state.recording_active:
+                return
+            self._state.recording_light_on = not self._state.recording_light_on
+            self._refresh_record_button_locked()
+
+    def stop_recording(self) -> None:
+        if not self._recording.is_recording:
+            return
+
+        try:
+            self._recording.stop()
+        except Exception as error:
+            self._log(f"recording stop failed: {error!r}")
+
+        with self._lock:
+            self._state.recording_active = False
+            self._state.recording_light_on = False
+            self._refresh_record_button_locked()
+
+    def _toggle_recording(self) -> None:
+        active_channels = None
+        if not self._recording.is_recording:
+            with self._lock:
+                active_channels = self._active_recording_channels_locked()
+
+        try:
+            recording_active = self._recording.toggle(active_channels)
+        except Exception as error:
+            self._log(f"recording toggle failed: {error!r}")
+            recording_active = self._recording.is_recording
+
+        with self._lock:
+            self._state.recording_active = recording_active
+            self._state.recording_light_on = recording_active
+            self._refresh_record_button_locked()
+
     def _sync_main_locked(self) -> None:
         self._send_main_fader_locked(self._state.main.fader)
         self._state.main.dca4_fader = self._state.main.fader
@@ -404,6 +467,10 @@ class MixerBridge:
                 self._refresh_knob_fader_locked(knob, target)
 
         for button in BUTTONS:
+            if button == RECORD_BUTTON and self._state.recording_active:
+                self._refresh_record_button_locked()
+                continue
+
             target = page.target_for_control(button)
             if target is None:
                 self._xtouch.set_button_light(button, False)
@@ -421,11 +488,24 @@ class MixerBridge:
     def _refresh_mute_light_locked(self, button: int, target: MixerTarget) -> None:
         self._xtouch.set_button_light(button, not self._strip_state(target).muted)
 
+    def _refresh_record_button_locked(self) -> None:
+        if self._state.recording_active:
+            self._xtouch.set_button_light(RECORD_BUTTON, self._state.recording_light_on)
+        else:
+            self._xtouch.set_button_light(RECORD_BUTTON, False)
+
     def _toggle_target_mute_locked(self, button: int, target: MixerTarget) -> None:
         state = self._strip_state(target)
         state.muted = not state.muted
         self._set_target_mute(target, state.muted)
         self._refresh_mute_light_locked(button, target)
+
+    def _active_recording_channels_locked(self) -> tuple[int, ...]:
+        return tuple(
+            channel
+            for channel in CHANNELS
+            if not self._strip_state(MixerTarget.channel(channel)).muted
+        )
 
     def _center_target_pan_locked(self, knob: int, target: MixerTarget) -> None:
         state = self._strip_state(target)
@@ -491,6 +571,10 @@ class MixerBridge:
 
     def _scaled_delta(self, delta: int) -> int:
         return delta * self._state.knob_step
+
+    def _log(self, message: str) -> None:
+        if self._debug is not None:
+            self._debug(message)
 
 
 class _ReconnectableInputClient(Protocol):
@@ -576,24 +660,46 @@ class _InputThread(threading.Thread):
         self._stop_event.set()
 
 
+class _RecordingBlinkThread(threading.Thread):
+    def __init__(self, bridge: MixerBridge):
+        super().__init__(name="recording-blink", daemon=True)
+        self._bridge = bridge
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(RECORD_BUTTON_BLINK_INTERVAL):
+            self._bridge.pulse_recording_light()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
 @dataclass
 class AppRuntime:
     bridge: MixerBridge
+    recording: RecordingService
     xtouch: MidoXTouchMiniClient
     xr18: XR18Client
     threads: list[_InputThread]
+    blink_thread: _RecordingBlinkThread
     status_messages: list[str]
 
     def start_threads(self) -> None:
         for thread in self.threads:
             thread.start()
+        self.blink_thread.start()
 
     def close(self) -> None:
+        self.blink_thread.stop()
         for thread in self.threads:
             thread.stop()
+        if self.blink_thread.ident is not None:
+            self.blink_thread.join(timeout=1)
         for thread in self.threads:
             if thread.ident is not None:
                 thread.join(timeout=1)
+        self.bridge.stop_recording()
+        self.recording.close()
         self.xtouch.close()
         self.xr18.close()
 
@@ -603,8 +709,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xtouch", default="X-TOUCH MINI", help="X-Touch Mini port name or substring")
     parser.add_argument("--xr18", default="XR18", help="XR18 port name or substring")
     parser.add_argument("--knob-step", type=int, default=1, help="Fader step per X-Touch knob detent")
+    parser.add_argument("--record-dir", default="recordings", help="Directory for multitrack recordings")
+    parser.add_argument("--record-audio-device", default=None, help="Audio input device name or substring")
+    parser.add_argument("--record-sample-rate", type=int, default=DEFAULT_SAMPLE_RATE, help="Recording sample rate")
+    parser.add_argument("--record-blocksize", type=int, default=DEFAULT_BLOCKSIZE, help="Audio callback block size")
     parser.add_argument("--demo", action="store_true", help="Run without XR18 MIDI ports and print mixer actions")
     parser.add_argument("--debug-midi", action="store_true", help="Print raw and routed MIDI input events")
+    parser.add_argument("--debug-recording", action="store_true", help="Print recording status messages")
+    parser.add_argument("--list-audio-devices", action="store_true", help="List audio input devices and exit")
     parser.add_argument("--list-ports", action="store_true", help="List MIDI ports and exit")
     return parser
 
@@ -616,6 +728,12 @@ def _print_ports() -> None:
     print("Output ports:")
     for name in mido.get_output_names():
         print(f"  {name}")
+
+
+def _print_audio_devices() -> None:
+    print("Audio input devices:")
+    for line in list_audio_input_devices():
+        print(f"  {line}")
 
 
 def _open_runtime(args: argparse.Namespace) -> AppRuntime:
@@ -634,7 +752,27 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
             xr18_status = f"Watching XR18 MIDI ports matching {args.xr18!r}."
 
         assert xr18 is not None
-        bridge = MixerBridge(xtouch, xr18, knob_step=args.knob_step)
+        recording_debug = (
+            (lambda message: _debug_log("recording", message)) if args.debug_recording else None
+        )
+        recording = RecordingService(
+            RecordingConfig(
+                directory=Path(args.record_dir),
+                audio_device=args.record_audio_device or args.xr18,
+                channels=DEFAULT_CHANNELS,
+                sample_rate=args.record_sample_rate,
+                blocksize=args.record_blocksize,
+            ),
+            notifier=SystemNotifier(debug=recording_debug),
+            debug=recording_debug,
+        )
+        bridge = MixerBridge(
+            xtouch,
+            xr18,
+            recording,
+            knob_step=args.knob_step,
+            debug=lambda message: _debug_log("bridge", message),
+        )
         xtouch_debug = (lambda message: _debug_log("xtouch-router", message)) if args.debug_midi else None
         xtouch_router = XTouchMiniMessageRouter(bridge, debug=xtouch_debug)
         threads = [
@@ -660,12 +798,15 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
 
         return AppRuntime(
             bridge=bridge,
+            recording=recording,
             xtouch=xtouch,
             xr18=xr18,
             threads=threads,
+            blink_thread=_RecordingBlinkThread(bridge),
             status_messages=[
                 f"Watching X-Touch Mini MIDI ports matching {args.xtouch!r}.",
                 xr18_status,
+                f"Recordings: {Path(args.record_dir)}",
             ],
         )
     except Exception:
@@ -681,6 +822,10 @@ def main() -> int:
 
     if args.list_ports:
         _print_ports()
+        return 0
+
+    if args.list_audio_devices:
+        _print_audio_devices()
         return 0
 
     runtime = _open_runtime(args)

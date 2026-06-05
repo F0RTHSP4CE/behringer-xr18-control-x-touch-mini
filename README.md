@@ -26,3 +26,25 @@ uv run xr18-controls.py --demo --debug-midi
 ```
 
 If a press has no `xtouch-midi: raw ...` line, the event did not reach the script. If it has a raw line but no `xtouch-router: button=...` line, the mapping needs fixing.
+
+## recording
+
+Press row 2, column 8 on the X-Touch Mini to start/stop recording. While recording, that button blinks on every page.
+
+Recordings are written as multichannel RF64 WAV files at 48 kHz / 24-bit PCM by default. RF64 keeps CPU load low like normal WAV, but supports files larger than 4 GB.
+
+When recording starts, the script snapshots channel mute state and writes only unmuted channel strips. If a muted channel is unmuted later, it is not added to the active recording. Muting a channel after recording starts does not remove it from that recording.
+
+The script records from the XR18 USB audio device, not from MIDI. List available audio inputs:
+
+```
+uv run xr18-controls.py --list-audio-devices
+```
+
+If the audio device name is different from the MIDI port name:
+
+```
+uv run xr18-controls.py --record-audio-device "XR18"
+```
+
+Recording filenames include the date/time plus random words, for example `2026-06-06_21-30-12_river-signal.wav`.
