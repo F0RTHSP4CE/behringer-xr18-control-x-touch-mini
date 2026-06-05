@@ -53,6 +53,8 @@ INPUT_POLL_INTERVAL = 0.01
 RECONNECT_INTERVAL = 1.0
 CONNECTION_CHECK_INTERVAL = 1.0
 RECORD_BUTTON_BLINK_INTERVAL = 0.5
+DEFAULT_RECORD_AUDIO_DEVICE = "X-AIR"
+DEFAULT_WINDOWS_RECORD_HOSTAPI = "ASIO"
 
 
 def _validate_index(name: str, value: int, count: int) -> None:
@@ -710,7 +712,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xr18", default="XR18", help="XR18 port name or substring")
     parser.add_argument("--knob-step", type=int, default=1, help="Fader step per X-Touch knob detent")
     parser.add_argument("--record-dir", default="recordings", help="Directory for multitrack recordings")
-    parser.add_argument("--record-audio-device", default=None, help="Audio input device name or substring")
+    parser.add_argument(
+        "--record-audio-device",
+        default=None,
+        help=f"Audio input device index, name, or substring (default: {DEFAULT_RECORD_AUDIO_DEVICE})",
+    )
+    parser.add_argument(
+        "--record-hostapi",
+        default=_default_record_hostapi(),
+        help="Audio host API name or substring. Defaults to ASIO on Windows; pass an empty value to search all.",
+    )
+    parser.add_argument(
+        "--record-channels",
+        type=int,
+        default=DEFAULT_CHANNELS,
+        help="XR18 USB input channel count to inspect; omit to use the selected device input count",
+    )
     parser.add_argument("--record-sample-rate", type=int, default=DEFAULT_SAMPLE_RATE, help="Recording sample rate")
     parser.add_argument("--record-blocksize", type=int, default=DEFAULT_BLOCKSIZE, help="Audio callback block size")
     parser.add_argument("--demo", action="store_true", help="Run without XR18 MIDI ports and print mixer actions")
@@ -758,8 +775,9 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
         recording = RecordingService(
             RecordingConfig(
                 directory=Path(args.record_dir),
-                audio_device=args.record_audio_device or args.xr18,
-                channels=DEFAULT_CHANNELS,
+                audio_device=args.record_audio_device or DEFAULT_RECORD_AUDIO_DEVICE,
+                hostapi=args.record_hostapi or None,
+                channels=args.record_channels,
                 sample_rate=args.record_sample_rate,
                 blocksize=args.record_blocksize,
             ),
@@ -807,6 +825,8 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
                 f"Watching X-Touch Mini MIDI ports matching {args.xtouch!r}.",
                 xr18_status,
                 f"Recordings: {Path(args.record_dir)}",
+                f"Recording audio device: {args.record_audio_device or DEFAULT_RECORD_AUDIO_DEVICE!r}",
+                f"Recording host API: {args.record_hostapi or 'any'}",
             ],
         )
     except Exception:
@@ -853,6 +873,12 @@ def _clamp_pan(value: int) -> int:
 
 def _debug_log(source: str, message: str) -> None:
     print(f"[{time.monotonic():.6f}] {source}: {message}", file=sys.stderr, flush=True)
+
+
+def _default_record_hostapi() -> str | None:
+    if sys.platform == "win32":
+        return DEFAULT_WINDOWS_RECORD_HOSTAPI
+    return None
 
 
 if __name__ == "__main__":

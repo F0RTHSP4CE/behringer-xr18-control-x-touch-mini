@@ -302,7 +302,8 @@ RECORDING_WORDS = (
 class RecordingConfig:
     directory: Path
     audio_device: str
-    channels: int = DEFAULT_CHANNELS
+    hostapi: str | None = None
+    channels: int | None = DEFAULT_CHANNELS
     sample_rate: int = DEFAULT_SAMPLE_RATE
     blocksize: int = DEFAULT_BLOCKSIZE
     queue_blocks: int = DEFAULT_QUEUE_BLOCKS
@@ -374,7 +375,7 @@ class RecordingService:
 
 class MultitrackRecorder:
     def __init__(self, config: RecordingConfig, debug: DebugLogger | None = None):
-        if config.channels < 1:
+        if config.channels is not None and config.channels < 1:
             raise ValueError("recording channels must be at least 1")
         if config.sample_rate < 1:
             raise ValueError("recording sample rate must be positive")
@@ -414,13 +415,18 @@ class MultitrackRecorder:
                 assert self._current_file is not None
                 return self._current_file
 
-            recorded_channels = _normalize_recorded_channels(active_channels, self._config.channels)
-            output_channels = len(recorded_channels)
-            channel_indices = tuple(channel - 1 for channel in recorded_channels)
             sd, sf = _load_audio_modules()
             self._config.directory.mkdir(parents=True, exist_ok=True)
             path = self._next_recording_path()
-            device_index = _pick_input_device(sd, self._config.audio_device, self._config.channels)
+            device_index, capture_channels = _pick_input_device(
+                sd,
+                self._config.audio_device,
+                self._config.hostapi,
+                self._config.channels,
+            )
+            recorded_channels = _normalize_recorded_channels(active_channels, capture_channels)
+            output_channels = len(recorded_channels)
+            channel_indices = tuple(channel - 1 for channel in recorded_channels)
             audio_queue: queue.Queue[Any] = queue.Queue(maxsize=self._config.queue_blocks)
 
             sound_file = sf.SoundFile(
@@ -452,7 +458,7 @@ class MultitrackRecorder:
                 stream = sd.InputStream(
                     samplerate=self._config.sample_rate,
                     device=device_index,
-                    channels=self._config.channels,
+                    channels=capture_channels,
                     blocksize=self._config.blocksize,
                     dtype="int32",
                     callback=self._audio_callback,
@@ -570,44 +576,107 @@ class MultitrackRecorder:
 def list_audio_input_devices() -> list[str]:
     sd, _ = _load_audio_modules()
     devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
     lines = []
     for index, device in enumerate(devices):
         input_channels = int(device.get("max_input_channels", 0))
         if input_channels > 0:
-            lines.append(f"{index}: {device['name']} ({input_channels} inputs)")
+            hostapi = hostapis[int(device["hostapi"])]["name"]
+            lines.append(f"{index}: {device['name']} ({input_channels} inputs, {hostapi})")
     return lines
 
 
-def _pick_input_device(sd, requested_name: str, channels: int) -> int | None:
+def _pick_input_device(
+    sd,
+    requested_name: str,
+    requested_hostapi: str | None,
+    channels: int | None,
+) -> tuple[int | None, int]:
     devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    requested = requested_name.strip()
+    if requested.isdigit():
+        index = int(requested)
+        try:
+            device = devices[index]
+        except IndexError as error:
+            raise RuntimeError(f"No audio input device with index {index}") from error
+        return index, _capture_channel_count(index, device, channels)
+
     candidates = [
         (index, device)
         for index, device in enumerate(devices)
-        if int(device.get("max_input_channels", 0)) >= channels
+        if _device_has_enough_inputs(device, channels)
+        and _hostapi_matches(device, hostapis, requested_hostapi)
     ]
 
     exact_matches = [
-        index for index, device in candidates if str(device["name"]).lower() == requested_name.lower()
+        index for index, device in candidates if str(device["name"]).lower() == requested.lower()
     ]
     if exact_matches:
-        return exact_matches[0]
+        index = exact_matches[0]
+        return index, _capture_channel_count(index, devices[index], channels)
 
-    requested = requested_name.lower()
-    matches = [index for index, device in candidates if requested in str(device["name"]).lower()]
+    requested_lower = requested.lower()
+    matches = [
+        index
+        for index, device in candidates
+        if requested_lower in str(device["name"]).lower()
+        or requested_lower in str(hostapis[int(device["hostapi"])]["name"]).lower()
+    ]
     if len(matches) == 1:
-        return matches[0]
+        index = matches[0]
+        return index, _capture_channel_count(index, devices[index], channels)
     if not matches:
         available = ", ".join(
             f"{index}: {device['name']} ({device['max_input_channels']} inputs)"
             for index, device in candidates
         )
+        channel_text = (
+            "any input channel count"
+            if channels is None
+            else f"at least {channels} channels"
+        )
+        hostapi_text = (
+            ""
+            if requested_hostapi is None
+            else f" on a host API matching {requested_hostapi!r}"
+        )
         raise RuntimeError(
-            f"No audio input device matching {requested_name!r} with at least {channels} channels. "
+            f"No audio input device matching {requested_name!r}{hostapi_text} with {channel_text}. "
             f"Available: {available or 'none'}"
         )
 
     names = ", ".join(str(devices[index]["name"]) for index in matches)
     raise RuntimeError(f"Multiple audio input devices match {requested_name!r}: {names}")
+
+
+def _device_has_enough_inputs(device, channels: int | None) -> bool:
+    max_input_channels = int(device.get("max_input_channels", 0))
+    if channels is None:
+        return max_input_channels > 0
+    return max_input_channels >= channels
+
+
+def _hostapi_matches(device, hostapis, requested_hostapi: str | None) -> bool:
+    if requested_hostapi is None:
+        return True
+    hostapi_name = str(hostapis[int(device["hostapi"])]["name"]).lower()
+    return requested_hostapi.lower() in hostapi_name
+
+
+def _capture_channel_count(index: int, device, channels: int | None) -> int:
+    max_input_channels = int(device.get("max_input_channels", 0))
+    if max_input_channels < 1:
+        raise RuntimeError(f"Audio device {index} has no input channels")
+    if channels is None:
+        return max_input_channels
+    if max_input_channels < channels:
+        raise RuntimeError(
+            f"Audio device {index} has {max_input_channels} inputs, but {channels} were requested"
+        )
+    return channels
 
 
 def _random_words() -> tuple[str, ...]:

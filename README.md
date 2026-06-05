@@ -35,16 +35,32 @@ Recordings are written as multichannel RF64 WAV files at 48 kHz / 24-bit PCM by 
 
 When recording starts, the script snapshots channel mute state and writes only unmuted channel strips. If a muted channel is unmuted later, it is not added to the active recording. Muting a channel after recording starts does not remove it from that recording.
 
-The script records from the XR18 USB audio device, not from MIDI. List available audio inputs:
+The script records from the XR18 USB audio device, not from MIDI. On Windows it prefers the ASIO host API and searches for an audio device matching `X-AIR`.
+
+List available audio inputs and their host APIs:
 
 ```
 uv run xr18-controls.py --list-audio-devices
 ```
 
-If the audio device name is different from the MIDI port name:
+For full multichannel XR18/X-Air recording on Windows, use an ASIO device from that list:
 
 ```
-uv run xr18-controls.py --record-audio-device "XR18"
+uv run xr18-controls.py --record-hostapi ASIO --record-audio-device "X-AIR"
 ```
+
+If you need to target a specific device, pass its numeric index:
+
+```
+uv run xr18-controls.py --record-audio-device 52
+```
+
+To intentionally search all Windows host APIs instead of ASIO:
+
+```
+uv run xr18-controls.py --record-hostapi ""
+```
+
+If the chosen device is `IN 1-8`, the script captures inputs 1-8 and writes only the unmuted channels among those inputs. Channels 9-16 cannot be recorded from an 8-input WDM/WASAPI-style device.
 
 Recording filenames include the date/time plus random words, for example `2026-06-06_21-30-12_river-signal.wav`.
