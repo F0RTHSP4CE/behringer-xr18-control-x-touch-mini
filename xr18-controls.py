@@ -19,48 +19,144 @@ from xr18_controls.xtouch_mini import (
 )
 from xr18_controls.xr18 import (
     DemoXR18Client,
+    FADER_MAX,
+    FADER_MIN,
     MidoXR18Client,
+    PAN_CENTER,
+    PAN_MAX,
+    PAN_MIN,
     XR18Client,
     XR18MessageRouter,
     XR18Ports,
 )
 
 
-@dataclass
-class ChannelState:
-    fader: int = 0
-    pan: int = 64
-    requested_mute: bool = False
-    applied_mute: bool = False
+KNOBS = range(1, 9)
+BUTTONS = range(1, 17)
+CHANNELS = range(1, 17)
+FX_RETURNS = range(1, 5)
+PC_AUX_KNOB = 8
+SECOND_CHANNEL_PAGE_OFFSET = 8
+METER_RING_STEPS = 11
+PAN_RING_STEPS = 10
+MAIN_DCA = 4
 
 
-class Page(Enum):
+def _validate_index(name: str, value: int, count: int) -> None:
+    if not 1 <= value <= count:
+        raise ValueError(f"{name} must be 1..{count}, got {value}")
+
+
+class PageId(Enum):
     FX = 0
     CHANNELS_1_8 = 1
     CHANNELS_9_16 = 2
 
 
+class MixerTargetKind(Enum):
+    CHANNEL = "channel"
+    FX_RETURN = "fx_return"
+    AUX = "aux"
+
+
+@dataclass(frozen=True)
+class MixerTarget:
+    kind: MixerTargetKind
+    index: int = 1
+
+    @classmethod
+    def channel(cls, channel: int) -> "MixerTarget":
+        _validate_index("channel", channel, len(CHANNELS))
+        return cls(MixerTargetKind.CHANNEL, channel)
+
+    @classmethod
+    def fx_return(cls, fx: int) -> "MixerTarget":
+        _validate_index("fx", fx, len(FX_RETURNS))
+        return cls(MixerTargetKind.FX_RETURN, fx)
+
+    @classmethod
+    def aux(cls) -> "MixerTarget":
+        return cls(MixerTargetKind.AUX)
+
+
+def _all_strip_targets() -> list[MixerTarget]:
+    return [
+        *(MixerTarget.channel(channel) for channel in CHANNELS),
+        *(MixerTarget.fx_return(fx) for fx in FX_RETURNS),
+        MixerTarget.aux(),
+    ]
+
+
+@dataclass(frozen=True)
+class PageDefinition:
+    page_id: PageId
+    layer_light: Layer | None
+    controls: dict[int, MixerTarget]
+
+    def target_for_control(self, control: int) -> MixerTarget | None:
+        return self.controls.get(control)
+
+    def knob_for_target(self, target: MixerTarget) -> int | None:
+        for knob, knob_target in self.controls.items():
+            if knob_target == target:
+                return knob
+        return None
+
+
 @dataclass
-class FxPageState:
-    fx_returns: dict[int, int] = field(default_factory=lambda: {index: 0 for index in range(1, 5)})
-    fx_return_mutes: dict[int, bool] = field(default_factory=lambda: {index: False for index in range(1, 5)})
-    fx_return_pans: dict[int, int] = field(default_factory=lambda: {index: 64 for index in range(1, 5)})
-    aux_fader: int = 0
-    aux_muted: bool = False
-    aux_pan: int = 64
+class StripState:
+    fader: int = FADER_MIN
+    pan: int = PAN_CENTER
+    muted: bool = False
+
+
+@dataclass
+class MainState:
+    fader: int = FADER_MIN
+    dca4_fader: int = FADER_MIN
+    muted: bool = False
 
 
 @dataclass
 class AppState:
-    active_page: Page = Page.FX
-    channels: dict[int, ChannelState] = field(default_factory=lambda: {index: ChannelState() for index in range(1, 17)})
-    fx_page: FxPageState = field(default_factory=FxPageState)
+    active_page: PageId = PageId.FX
+    strips: dict[MixerTarget, StripState] = field(
+        default_factory=lambda: {target: StripState() for target in _all_strip_targets()}
+    )
     pan_knobs: set[int] = field(default_factory=set)
-    last_knob_taps: dict[int, tuple[int, float]] = field(default_factory=dict)
-    main_fader: int = 0
-    dca4_fader: int = 0
-    main_muted: bool = False
+    main: MainState = field(default_factory=MainState)
     knob_step: int = 1
+
+
+PAGE_DEFINITIONS = {
+    PageId.FX: PageDefinition(
+        page_id=PageId.FX,
+        layer_light=None,
+        controls={
+            1: MixerTarget.fx_return(1),
+            2: MixerTarget.fx_return(2),
+            3: MixerTarget.fx_return(3),
+            4: MixerTarget.fx_return(4),
+            PC_AUX_KNOB: MixerTarget.aux(),
+        },
+    ),
+    PageId.CHANNELS_1_8: PageDefinition(
+        page_id=PageId.CHANNELS_1_8,
+        layer_light=Layer.A,
+        controls={knob: MixerTarget.channel(knob) for knob in KNOBS},
+    ),
+    PageId.CHANNELS_9_16: PageDefinition(
+        page_id=PageId.CHANNELS_9_16,
+        layer_light=Layer.B,
+        controls={knob: MixerTarget.channel(knob + SECOND_CHANNEL_PAGE_OFFSET) for knob in KNOBS},
+    ),
+}
+
+
+PAGE_FOR_LAYER = {
+    Layer.A: PageId.CHANNELS_1_8,
+    Layer.B: PageId.CHANNELS_9_16,
+}
 
 
 class FeedbackEchoFilter:
@@ -89,6 +185,28 @@ class FeedbackEchoFilter:
         del self._pending[:expired_count]
 
 
+@dataclass(frozen=True)
+class TapKey:
+    page: PageId
+    knob: int
+
+
+class DoubleTapDetector:
+    def __init__(self, timeout: float):
+        self._timeout = timeout
+        self._last_taps: dict[TapKey, float] = {}
+
+    def remember(self, key: TapKey) -> None:
+        self._last_taps[key] = time.monotonic()
+
+    def consume(self, key: TapKey) -> bool:
+        timestamp = self._last_taps.pop(key, None)
+        return timestamp is not None and time.monotonic() - timestamp <= self._timeout
+
+    def clear(self) -> None:
+        self._last_taps.clear()
+
+
 class MixerBridge:
     _double_tap_timeout = 0.15
 
@@ -98,6 +216,7 @@ class MixerBridge:
         self._state = AppState(knob_step=knob_step)
         self._main_fader_echo = FeedbackEchoFilter()
         self._dca4_fader_echo = FeedbackEchoFilter()
+        self._double_taps = DoubleTapDetector(self._double_tap_timeout)
         self._lock = threading.Lock()
 
     def start(self) -> None:
@@ -110,381 +229,254 @@ class MixerBridge:
 
     def on_knob_turn(self, knob: int, delta: int) -> None:
         with self._lock:
-            if self._state.active_page == Page.FX:
-                self._turn_fx_page_knob_locked(knob, delta)
+            target = self._current_page_locked().target_for_control(knob)
+            if target is None:
                 return
 
-            channel = self._channel_for_knob_locked(knob)
-            state = self._state.channels[channel]
+            state = self._strip_state(target)
             if knob in self._state.pan_knobs:
-                state.pan = _clamp_pan(state.pan + delta * self._state.knob_step)
-                self._xr18.set_channel_pan(channel, state.pan)
-                self._refresh_pan_locked(knob, channel)
+                state.pan = _clamp_pan(state.pan + self._scaled_delta(delta))
+                self._set_target_pan(target, state.pan)
+                self._refresh_knob_pan_locked(knob, target)
                 return
 
-            state.fader = _clamp(state.fader + delta * self._state.knob_step)
-            self._xr18.set_channel_fader(channel, state.fader)
-            self._refresh_knob_locked(knob, channel)
+            state.fader = _clamp_fader(state.fader + self._scaled_delta(delta))
+            self._set_target_fader(target, state.fader)
+            self._refresh_knob_fader_locked(knob, target)
 
     def on_knob_press(self, knob: int, down: bool) -> None:
         with self._lock:
-            if self._state.active_page == Page.FX:
-                self._handle_fx_page_knob_press_locked(knob, down)
+            target = self._current_page_locked().target_for_control(knob)
+            if target is None:
                 return
 
-            if not self._channel_page_active_locked():
-                return
-
-            channel = self._channel_for_knob_locked(knob)
             if down:
                 self._state.pan_knobs.add(knob)
-                if self._consume_double_tap_locked(knob, channel):
-                    self._center_pan_locked(knob, channel)
-                self._refresh_pan_locked(knob, channel)
+                if self._double_taps.consume(self._tap_key(knob)):
+                    self._center_target_pan_locked(knob, target)
+                self._refresh_knob_pan_locked(knob, target)
             else:
                 self._state.pan_knobs.discard(knob)
-                self._state.last_knob_taps[knob] = (channel, time.monotonic())
-                self._refresh_knob_locked(knob, channel)
+                self._double_taps.remember(self._tap_key(knob))
+                self._refresh_knob_fader_locked(knob, target)
 
     def on_button(self, button: int, down: bool) -> None:
         if not down:
             return
 
         with self._lock:
-            if self._state.active_page == Page.FX:
-                self._toggle_fx_page_mute_locked(button)
-                return
-
-            if self._channel_page_active_locked() and button <= 8:
-                channel = self._channel_for_button_locked(button)
-                self._toggle_mute_locked(channel)
+            target = self._current_page_locked().target_for_control(button)
+            if target is not None:
+                self._toggle_target_mute_locked(button, target)
 
     def on_layer(self, layer: Layer, down: bool) -> None:
         if not down:
             return
 
         with self._lock:
-            page = Page.CHANNELS_1_8 if layer == Layer.A else Page.CHANNELS_9_16
+            page = PAGE_FOR_LAYER[layer]
             if self._state.active_page == page:
-                page = Page.FX
+                page = PageId.FX
 
             if self._state.active_page != page:
                 self._state.active_page = page
                 self._state.pan_knobs.clear()
-                self._state.last_knob_taps.clear()
+                self._double_taps.clear()
                 self._refresh_layer_lights_locked()
                 self._refresh_page_locked()
 
     def on_fader(self, value: int) -> None:
         with self._lock:
-            self._state.main_fader = value
+            self._state.main.fader = _clamp_fader(value)
             self._sync_main_locked()
 
     def on_channel_fader(self, channel: int, value: int) -> None:
         with self._lock:
-            self._state.channels[channel].fader = value
-            if self._channel_is_visible_locked(channel):
-                knob = self._visible_knob(channel)
-                if knob not in self._state.pan_knobs:
-                    self._refresh_knob_locked(knob, channel)
+            self._on_target_fader_locked(MixerTarget.channel(channel), value)
 
     def on_channel_mute(self, channel: int, muted: bool) -> None:
         with self._lock:
-            state = self._state.channels[channel]
-            state.requested_mute = muted
-            state.applied_mute = muted
-            if self._channel_is_visible_locked(channel):
-                self._set_mute_light_locked(channel)
+            self._on_target_mute_locked(MixerTarget.channel(channel), muted)
 
     def on_channel_pan(self, channel: int, value: int) -> None:
         with self._lock:
-            self._state.channels[channel].pan = _clamp_pan(value)
-            if self._channel_is_visible_locked(channel):
-                knob = self._visible_knob(channel)
-                if knob in self._state.pan_knobs:
-                    self._refresh_pan_locked(knob, channel)
+            self._on_target_pan_locked(MixerTarget.channel(channel), value)
 
     def on_aux_fader(self, value: int) -> None:
         with self._lock:
-            self._state.fx_page.aux_fader = _clamp(value)
-            if self._state.active_page == Page.FX and 8 not in self._state.pan_knobs:
-                self._refresh_fx_page_knob_locked(8)
+            self._on_target_fader_locked(MixerTarget.aux(), value)
 
     def on_fx_return_fader(self, fx: int, value: int) -> None:
         with self._lock:
-            self._state.fx_page.fx_returns[fx] = _clamp(value)
-            if self._state.active_page == Page.FX and fx not in self._state.pan_knobs:
-                self._refresh_fx_page_knob_locked(fx)
+            self._on_target_fader_locked(MixerTarget.fx_return(fx), value)
 
     def on_aux_mute(self, muted: bool) -> None:
         with self._lock:
-            self._state.fx_page.aux_muted = muted
-            if self._state.active_page == Page.FX:
-                self._set_fx_page_mute_light_locked(8)
+            self._on_target_mute_locked(MixerTarget.aux(), muted)
 
     def on_fx_return_mute(self, fx: int, muted: bool) -> None:
         with self._lock:
-            self._state.fx_page.fx_return_mutes[fx] = muted
-            if self._state.active_page == Page.FX:
-                self._set_fx_page_mute_light_locked(fx)
+            self._on_target_mute_locked(MixerTarget.fx_return(fx), muted)
 
     def on_aux_pan(self, value: int) -> None:
         with self._lock:
-            self._state.fx_page.aux_pan = _clamp_pan(value)
-            if self._state.active_page == Page.FX and 8 in self._state.pan_knobs:
-                self._refresh_fx_page_pan_locked(8)
+            self._on_target_pan_locked(MixerTarget.aux(), value)
 
     def on_fx_return_pan(self, fx: int, value: int) -> None:
         with self._lock:
-            self._state.fx_page.fx_return_pans[fx] = _clamp_pan(value)
-            if self._state.active_page == Page.FX and fx in self._state.pan_knobs:
-                self._refresh_fx_page_pan_locked(fx)
+            self._on_target_pan_locked(MixerTarget.fx_return(fx), value)
 
     def on_main_fader(self, value: int) -> None:
         with self._lock:
             if self._main_fader_echo.consume(value):
-                self._state.main_fader = value
+                self._state.main.fader = _clamp_fader(value)
                 return
 
-            self._state.main_fader = value
-            if self._state.dca4_fader != value:
-                self._state.dca4_fader = value
+            value = _clamp_fader(value)
+            self._state.main.fader = value
+            if self._state.main.dca4_fader != value:
+                self._state.main.dca4_fader = value
                 self._send_dca4_fader_locked(value)
 
     def on_dca_fader(self, dca: int, value: int) -> None:
-        if dca != 4:
+        if dca != MAIN_DCA:
             return
 
         with self._lock:
             if self._dca4_fader_echo.consume(value):
-                self._state.dca4_fader = value
+                self._state.main.dca4_fader = _clamp_fader(value)
                 return
 
-            self._state.dca4_fader = value
-            if self._state.main_fader != value:
-                self._state.main_fader = value
+            value = _clamp_fader(value)
+            self._state.main.dca4_fader = value
+            if self._state.main.fader != value:
+                self._state.main.fader = value
                 self._send_main_fader_locked(value)
 
     def on_main_mute(self, muted: bool) -> None:
         with self._lock:
-            self._state.main_muted = muted
-
-    def _toggle_mute_locked(self, channel: int) -> None:
-        state = self._state.channels[channel]
-        state.requested_mute = not state.requested_mute
-        self._sync_channel_mute_locked(channel)
-        if self._channel_is_visible_locked(channel):
-            self._set_mute_light_locked(channel)
-
-    def _sync_channel_mute_locked(self, channel: int) -> None:
-        state = self._state.channels[channel]
-        desired = state.requested_mute
-        if state.applied_mute != desired:
-            state.applied_mute = desired
-            self._xr18.set_channel_mute(channel, desired)
-
-    def _consume_double_tap_locked(self, knob: int, channel: int) -> bool:
-        previous = self._state.last_knob_taps.pop(knob, None)
-        if previous is None:
-            return False
-
-        previous_channel, timestamp = previous
-        return previous_channel == channel and time.monotonic() - timestamp <= self._double_tap_timeout
-
-    def _center_pan_locked(self, knob: int, channel: int) -> None:
-        state = self._state.channels[channel]
-        state.pan = 64
-        self._xr18.set_channel_pan(channel, state.pan)
-        self._refresh_pan_locked(knob, channel)
+            self._state.main.muted = muted
 
     def _sync_main_locked(self) -> None:
-        self._send_main_fader_locked(self._state.main_fader)
-        self._state.dca4_fader = self._state.main_fader
-        self._send_dca4_fader_locked(self._state.main_fader)
-        self._xr18.set_main_mute(self._state.main_muted)
+        self._send_main_fader_locked(self._state.main.fader)
+        self._state.main.dca4_fader = self._state.main.fader
+        self._send_dca4_fader_locked(self._state.main.fader)
+        self._xr18.set_main_mute(self._state.main.muted)
 
     def _send_main_fader_locked(self, value: int) -> None:
-        clamped = _clamp(value)
+        clamped = _clamp_fader(value)
         self._main_fader_echo.remember(clamped)
         self._xr18.set_main_fader(clamped)
 
     def _send_dca4_fader_locked(self, value: int) -> None:
-        clamped = _clamp(value)
+        clamped = _clamp_fader(value)
         self._dca4_fader_echo.remember(clamped)
-        self._xr18.set_dca_fader(4, clamped)
+        self._xr18.set_dca_fader(MAIN_DCA, clamped)
 
     def _refresh_layer_lights_locked(self) -> None:
-        self._xtouch.set_layer_light(Layer.A, self._state.active_page == Page.CHANNELS_1_8)
-        self._xtouch.set_layer_light(Layer.B, self._state.active_page == Page.CHANNELS_9_16)
+        page = self._current_page_locked()
+        self._xtouch.set_layer_light(Layer.A, page.layer_light == Layer.A)
+        self._xtouch.set_layer_light(Layer.B, page.layer_light == Layer.B)
 
     def _refresh_page_locked(self) -> None:
-        if self._state.active_page == Page.FX:
-            self._refresh_fx_page_locked()
-        else:
-            self._refresh_channel_page_locked()
-
-    def _refresh_fx_page_locked(self) -> None:
-        for knob in range(1, 9):
-            if knob in self._state.pan_knobs and self._fx_page_knob_active_locked(knob):
-                self._refresh_fx_page_pan_locked(knob)
+        page = self._current_page_locked()
+        for knob in KNOBS:
+            target = page.target_for_control(knob)
+            if target is None:
+                self._xtouch.set_knob_ring(knob, FADER_MIN)
+            elif knob in self._state.pan_knobs:
+                self._refresh_knob_pan_locked(knob, target)
             else:
-                self._refresh_fx_page_knob_locked(knob)
+                self._refresh_knob_fader_locked(knob, target)
 
-        for button in range(1, 17):
-            if button in {1, 2, 3, 4, 8}:
-                self._set_fx_page_mute_light_locked(button)
-            else:
+        for button in BUTTONS:
+            target = page.target_for_control(button)
+            if target is None:
                 self._xtouch.set_button_light(button, False)
-
-    def _refresh_fx_page_knob_locked(self, knob: int) -> None:
-        if 1 <= knob <= 4:
-            level = round(self._state.fx_page.fx_returns[knob] * 11 / 127)
-        elif knob == 8:
-            level = round(self._state.fx_page.aux_fader * 11 / 127)
-        else:
-            level = 0
-        self._xtouch.set_knob_ring(knob, level)
-
-    def _turn_fx_page_knob_locked(self, knob: int, delta: int) -> None:
-        if knob in self._state.pan_knobs:
-            self._turn_fx_page_pan_locked(knob, delta)
-            return
-
-        if 1 <= knob <= 4:
-            value = _clamp(self._state.fx_page.fx_returns[knob] + delta * self._state.knob_step)
-            self._state.fx_page.fx_returns[knob] = value
-            self._xr18.set_fx_return_fader(knob, value)
-            self._refresh_fx_page_knob_locked(knob)
-        elif knob == 8:
-            value = _clamp(self._state.fx_page.aux_fader + delta * self._state.knob_step)
-            self._state.fx_page.aux_fader = value
-            self._xr18.set_aux_fader(value)
-            self._refresh_fx_page_knob_locked(knob)
-
-    def _handle_fx_page_knob_press_locked(self, knob: int, down: bool) -> None:
-        if not self._fx_page_knob_active_locked(knob):
-            return
-
-        if down:
-            self._state.pan_knobs.add(knob)
-            if self._consume_double_tap_locked(knob, knob):
-                self._center_fx_page_pan_locked(knob)
-            self._refresh_fx_page_pan_locked(knob)
-        else:
-            self._state.pan_knobs.discard(knob)
-            self._state.last_knob_taps[knob] = (knob, time.monotonic())
-            self._refresh_fx_page_knob_locked(knob)
-
-    def _turn_fx_page_pan_locked(self, knob: int, delta: int) -> None:
-        if 1 <= knob <= 4:
-            value = _clamp_pan(self._state.fx_page.fx_return_pans[knob] + delta * self._state.knob_step)
-            self._state.fx_page.fx_return_pans[knob] = value
-            self._xr18.set_fx_return_pan(knob, value)
-            self._refresh_fx_page_pan_locked(knob)
-        elif knob == 8:
-            value = _clamp_pan(self._state.fx_page.aux_pan + delta * self._state.knob_step)
-            self._state.fx_page.aux_pan = value
-            self._xr18.set_aux_pan(value)
-            self._refresh_fx_page_pan_locked(knob)
-
-    def _center_fx_page_pan_locked(self, knob: int) -> None:
-        if 1 <= knob <= 4:
-            self._state.fx_page.fx_return_pans[knob] = 64
-            self._xr18.set_fx_return_pan(knob, 64)
-            self._refresh_fx_page_pan_locked(knob)
-        elif knob == 8:
-            self._state.fx_page.aux_pan = 64
-            self._xr18.set_aux_pan(64)
-            self._refresh_fx_page_pan_locked(knob)
-
-    def _refresh_fx_page_pan_locked(self, knob: int) -> None:
-        if 1 <= knob <= 4:
-            pan = self._state.fx_page.fx_return_pans[knob]
-        elif knob == 8:
-            pan = self._state.fx_page.aux_pan
-        else:
-            return
-
-        level = round((pan - 1) * 10 / 126) + 1
-        self._xtouch.set_knob_pan_ring(knob, level)
-
-    def _fx_page_knob_active_locked(self, knob: int) -> bool:
-        return 1 <= knob <= 4 or knob == 8
-
-    def _toggle_fx_page_mute_locked(self, button: int) -> None:
-        if 1 <= button <= 4:
-            muted = not self._state.fx_page.fx_return_mutes[button]
-            self._state.fx_page.fx_return_mutes[button] = muted
-            self._xr18.set_fx_return_mute(button, muted)
-            self._set_fx_page_mute_light_locked(button)
-        elif button == 8:
-            self._state.fx_page.aux_muted = not self._state.fx_page.aux_muted
-            self._xr18.set_aux_mute(self._state.fx_page.aux_muted)
-            self._set_fx_page_mute_light_locked(button)
-
-    def _set_fx_page_mute_light_locked(self, button: int) -> None:
-        if 1 <= button <= 4:
-            muted = self._state.fx_page.fx_return_mutes[button]
-        elif button == 8:
-            muted = self._state.fx_page.aux_muted
-        else:
-            muted = True
-        self._xtouch.set_button_light(button, not muted)
-
-    def _refresh_channel_page_locked(self) -> None:
-        start = self._active_bank_start_locked()
-        for knob in range(1, 9):
-            channel = start + knob - 1
-            if knob in self._state.pan_knobs:
-                self._refresh_pan_locked(knob, channel)
             else:
-                self._refresh_knob_locked(knob, channel)
-            self._set_mute_light_locked(channel)
-            self._xtouch.set_button_light(knob + 8, False)
+                self._refresh_mute_light_locked(button, target)
 
-    def _refresh_knob_locked(self, knob: int, channel: int) -> None:
-        level = round(self._state.channels[channel].fader * 11 / 127)
+    def _refresh_knob_fader_locked(self, knob: int, target: MixerTarget) -> None:
+        level = round(self._strip_state(target).fader * METER_RING_STEPS / FADER_MAX)
         self._xtouch.set_knob_ring(knob, level)
 
-    def _refresh_pan_locked(self, knob: int, channel: int) -> None:
-        level = round((self._state.channels[channel].pan - 1) * 10 / 126) + 1
+    def _refresh_knob_pan_locked(self, knob: int, target: MixerTarget) -> None:
+        level = round((self._strip_state(target).pan - PAN_MIN) * PAN_RING_STEPS / (PAN_MAX - PAN_MIN)) + 1
         self._xtouch.set_knob_pan_ring(knob, level)
 
-    def _channel_for_knob_locked(self, knob: int) -> int:
-        if not 1 <= knob <= 8:
-            raise ValueError(f"knob must be 1..8, got {knob}")
-        return self._active_bank_start_locked() + knob - 1
+    def _refresh_mute_light_locked(self, button: int, target: MixerTarget) -> None:
+        self._xtouch.set_button_light(button, not self._strip_state(target).muted)
 
-    def _channel_for_button_locked(self, button: int) -> int:
-        if not 1 <= button <= 16:
-            raise ValueError(f"button must be 1..16, got {button}")
-        bank_button = button if button <= 8 else button - 8
-        return self._active_bank_start_locked() + bank_button - 1
+    def _toggle_target_mute_locked(self, button: int, target: MixerTarget) -> None:
+        state = self._strip_state(target)
+        state.muted = not state.muted
+        self._set_target_mute(target, state.muted)
+        self._refresh_mute_light_locked(button, target)
 
-    def _channel_is_visible_locked(self, channel: int) -> bool:
-        if not self._channel_page_active_locked():
-            return False
-        start = self._active_bank_start_locked()
-        return start <= channel <= start + 7
+    def _center_target_pan_locked(self, knob: int, target: MixerTarget) -> None:
+        state = self._strip_state(target)
+        state.pan = PAN_CENTER
+        self._set_target_pan(target, state.pan)
+        self._refresh_knob_pan_locked(knob, target)
 
-    def _visible_knob(self, channel: int) -> int:
-        return channel - self._active_bank_start_locked() + 1
+    def _on_target_fader_locked(self, target: MixerTarget, value: int) -> None:
+        state = self._strip_state(target)
+        state.fader = _clamp_fader(value)
+        knob = self._visible_knob_for_target_locked(target)
+        if knob is not None and knob not in self._state.pan_knobs:
+            self._refresh_knob_fader_locked(knob, target)
 
-    def _mute_button(self, channel: int) -> int:
-        return self._visible_knob(channel)
+    def _on_target_mute_locked(self, target: MixerTarget, muted: bool) -> None:
+        self._strip_state(target).muted = muted
+        knob = self._visible_knob_for_target_locked(target)
+        if knob is not None:
+            self._refresh_mute_light_locked(knob, target)
 
-    def _set_mute_light_locked(self, channel: int) -> None:
-        self._xtouch.set_button_light(self._mute_button(channel), not self._state.channels[channel].applied_mute)
+    def _on_target_pan_locked(self, target: MixerTarget, value: int) -> None:
+        state = self._strip_state(target)
+        state.pan = _clamp_pan(value)
+        knob = self._visible_knob_for_target_locked(target)
+        if knob is not None and knob in self._state.pan_knobs:
+            self._refresh_knob_pan_locked(knob, target)
 
-    def _channel_page_active_locked(self) -> bool:
-        return self._state.active_page in {Page.CHANNELS_1_8, Page.CHANNELS_9_16}
+    def _set_target_fader(self, target: MixerTarget, value: int) -> None:
+        if target.kind == MixerTargetKind.CHANNEL:
+            self._xr18.set_channel_fader(target.index, value)
+        elif target.kind == MixerTargetKind.FX_RETURN:
+            self._xr18.set_fx_return_fader(target.index, value)
+        elif target.kind == MixerTargetKind.AUX:
+            self._xr18.set_aux_fader(value)
 
-    def _active_bank_start_locked(self) -> int:
-        if self._state.active_page == Page.CHANNELS_1_8:
-            return 1
-        if self._state.active_page == Page.CHANNELS_9_16:
-            return 9
-        raise RuntimeError(f"page {self._state.active_page.value} has no channel bank")
+    def _set_target_mute(self, target: MixerTarget, muted: bool) -> None:
+        if target.kind == MixerTargetKind.CHANNEL:
+            self._xr18.set_channel_mute(target.index, muted)
+        elif target.kind == MixerTargetKind.FX_RETURN:
+            self._xr18.set_fx_return_mute(target.index, muted)
+        elif target.kind == MixerTargetKind.AUX:
+            self._xr18.set_aux_mute(muted)
+
+    def _set_target_pan(self, target: MixerTarget, value: int) -> None:
+        if target.kind == MixerTargetKind.CHANNEL:
+            self._xr18.set_channel_pan(target.index, value)
+        elif target.kind == MixerTargetKind.FX_RETURN:
+            self._xr18.set_fx_return_pan(target.index, value)
+        elif target.kind == MixerTargetKind.AUX:
+            self._xr18.set_aux_pan(value)
+
+    def _strip_state(self, target: MixerTarget) -> StripState:
+        return self._state.strips[target]
+
+    def _current_page_locked(self) -> PageDefinition:
+        return PAGE_DEFINITIONS[self._state.active_page]
+
+    def _visible_knob_for_target_locked(self, target: MixerTarget) -> int | None:
+        return self._current_page_locked().knob_for_target(target)
+
+    def _tap_key(self, knob: int) -> TapKey:
+        return TapKey(self._state.active_page, knob)
+
+    def _scaled_delta(self, delta: int) -> int:
+        return delta * self._state.knob_step
 
 
 class _InputThread(threading.Thread):
@@ -647,12 +639,12 @@ def main() -> int:
         runtime.close()
 
 
-def _clamp(value: int) -> int:
-    return max(0, min(127, value))
+def _clamp_fader(value: int) -> int:
+    return max(FADER_MIN, min(FADER_MAX, value))
 
 
 def _clamp_pan(value: int) -> int:
-    return max(1, min(127, value))
+    return max(PAN_MIN, min(PAN_MAX, value))
 
 
 def _debug_log(source: str, message: str) -> None:
