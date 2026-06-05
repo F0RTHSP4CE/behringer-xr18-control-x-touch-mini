@@ -6,6 +6,9 @@ from typing import Protocol
 
 import mido
 
+from xr18_controls.midi_ports import DebugLogger
+from xr18_controls.midi_ports import ReconnectableMidiIO
+
 
 FADER_MIN = 0
 FADER_MAX = 127
@@ -117,31 +120,45 @@ class XR18Client(Protocol):
 
 @dataclass(frozen=True)
 class XR18Ports:
-    input_name: str
-    output_name: str
+    requested_name: str
 
 
 class MidoXR18Client:
     """MIDO-backed XR18 client using the documented CC lanes."""
 
-    def __init__(self, ports: XR18Ports):
-        self._input = mido.open_input(ports.input_name)
-        try:
-            self._output = mido.open_output(ports.output_name)
-        except Exception:
-            self._input.close()
-            raise
+    def __init__(self, ports: XR18Ports, debug: DebugLogger | None = None):
+        self._io = ReconnectableMidiIO(
+            label="XR18",
+            requested_name=ports.requested_name,
+            debug=debug,
+        )
 
     @property
-    def input_port(self) -> mido.ports.BaseInput:
-        return self._input
+    def connected(self) -> bool:
+        return self._io.connected
+
+    @property
+    def input_port(self):
+        return self._io.input_port
+
+    @property
+    def description(self) -> str:
+        return self._io.description
+
+    def connect(self) -> bool:
+        return self._io.connect()
+
+    def disconnect(self, reason: str | None = None) -> None:
+        self._io.disconnect(reason)
+
+    def check_connection(self) -> None:
+        self._io.check_connection()
 
     def close(self) -> None:
-        self._input.close()
-        self._output.close()
+        self._io.close()
 
-    def send(self, message: mido.Message) -> None:
-        self._output.send(message)
+    def send(self, message: mido.Message) -> bool:
+        return self._io.send(message)
 
     def set_channel_fader(self, channel: int, value: int) -> None:
         self.send(_cc(CCLane.FADER, _channel_control(channel), _clamp_fader(value)))

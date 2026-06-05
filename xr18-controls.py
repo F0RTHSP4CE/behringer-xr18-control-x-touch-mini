@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable
+from typing import Callable, Protocol
 
 import mido
 
@@ -40,6 +40,9 @@ SECOND_CHANNEL_PAGE_OFFSET = 8
 METER_RING_STEPS = 11
 PAN_RING_STEPS = 10
 MAIN_DCA = 4
+INPUT_POLL_INTERVAL = 0.01
+RECONNECT_INTERVAL = 1.0
+CONNECTION_CHECK_INTERVAL = 1.0
 
 
 def _validate_index(name: str, value: int, count: int) -> None:
@@ -221,10 +224,15 @@ class MixerBridge:
 
     def start(self) -> None:
         with self._lock:
-            self._xtouch.set_mackie_mode()
-            self._xtouch.reset()
-            self._refresh_layer_lights_locked()
-            self._refresh_page_locked()
+            self._initialize_controller_locked()
+            self._sync_main_locked()
+
+    def refresh_controller(self) -> None:
+        with self._lock:
+            self._initialize_controller_locked()
+
+    def sync_mixer(self) -> None:
+        with self._lock:
             self._sync_main_locked()
 
     def on_knob_turn(self, knob: int, delta: int) -> None:
@@ -363,6 +371,12 @@ class MixerBridge:
         self._send_dca4_fader_locked(self._state.main.fader)
         self._xr18.set_main_mute(self._state.main.muted)
 
+    def _initialize_controller_locked(self) -> None:
+        self._xtouch.set_mackie_mode()
+        self._xtouch.reset()
+        self._refresh_layer_lights_locked()
+        self._refresh_page_locked()
+
     def _send_main_fader_locked(self, value: int) -> None:
         clamped = _clamp_fader(value)
         self._main_fader_echo.remember(clamped)
@@ -479,19 +493,74 @@ class MixerBridge:
         return delta * self._state.knob_step
 
 
+class _ReconnectableInputClient(Protocol):
+    @property
+    def connected(self) -> bool:
+        ...
+
+    @property
+    def input_port(self):
+        ...
+
+    @property
+    def description(self) -> str:
+        ...
+
+    def connect(self) -> bool:
+        ...
+
+    def disconnect(self, reason: str | None = None) -> None:
+        ...
+
+    def check_connection(self) -> None:
+        ...
+
+
 class _InputThread(threading.Thread):
-    def __init__(self, port: mido.ports.BaseInput, router, name: str, debug: bool = False):
+    def __init__(
+        self,
+        client: _ReconnectableInputClient,
+        router,
+        name: str,
+        on_connect: Callable[[], None] | None = None,
+        debug: bool = False,
+    ):
         super().__init__(name=name, daemon=True)
-        self._port = port
+        self._client = client
         self._router = router
+        self._on_connect = on_connect
         self._debug = debug
         self._stop_event = threading.Event()
 
     def run(self) -> None:
+        next_connection_check = 0.0
         while not self._stop_event.is_set():
-            had_message = False
-            for message in self._port.iter_pending():
-                had_message = True
+            now = time.monotonic()
+            if now >= next_connection_check:
+                self._client.check_connection()
+                next_connection_check = now + CONNECTION_CHECK_INTERVAL
+
+            if self._client.connect() and self._on_connect is not None:
+                self._on_connect()
+
+            if not self._client.connected:
+                time.sleep(RECONNECT_INTERVAL)
+                continue
+
+            port = self._client.input_port
+            if port is None:
+                self._client.disconnect("input port disappeared")
+                time.sleep(RECONNECT_INTERVAL)
+                continue
+
+            try:
+                pending_messages = list(port.iter_pending())
+            except Exception as error:
+                self._client.disconnect(f"input failed: {error}")
+                time.sleep(RECONNECT_INTERVAL)
+                continue
+
+            for message in pending_messages:
                 if self._debug:
                     _debug_log(self.name, f"raw {message}")
                 try:
@@ -499,8 +568,9 @@ class _InputThread(threading.Thread):
                 except Exception as error:
                     _debug_log(self.name, f"router error for {message}: {error!r}")
                     raise
-            if not had_message:
-                time.sleep(0.01)
+
+            if not pending_messages:
+                time.sleep(INPUT_POLL_INTERVAL)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -528,20 +598,6 @@ class AppRuntime:
         self.xr18.close()
 
 
-def _pick_port_name(requested: str, available: Iterable[str]) -> str:
-    available_list = list(available)
-    exact = [name for name in available_list if name == requested]
-    if exact:
-        return exact[0]
-
-    matches = [name for name in available_list if requested.lower() in name.lower()]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise RuntimeError(f"No MIDI port matches '{requested}'. Available: {available_list}")
-    raise RuntimeError(f"Multiple MIDI ports match '{requested}': {matches}")
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bridge a Behringer X-Touch Mini to an XR18 over MIDI.")
     parser.add_argument("--xtouch", default="X-TOUCH MINI", help="X-Touch Mini port name or substring")
@@ -563,12 +619,8 @@ def _print_ports() -> None:
 
 
 def _open_runtime(args: argparse.Namespace) -> AppRuntime:
-    input_names = mido.get_input_names()
-    output_names = mido.get_output_names()
-
-    xtouch_input = _pick_port_name(args.xtouch, input_names)
-    xtouch_output = _pick_port_name(args.xtouch, output_names)
-    xtouch = MidoXTouchMiniClient(XTouchMiniPorts(xtouch_input, xtouch_output))
+    port_debug = lambda message: _debug_log("midi-ports", message)
+    xtouch = MidoXTouchMiniClient(XTouchMiniPorts(args.xtouch), debug=port_debug)
 
     xr18: XR18Client | None = None
     mido_xr18: MidoXR18Client | None = None
@@ -577,24 +629,31 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
             xr18 = DemoXR18Client()
             xr18_status = "XR18 demo mode: no mixer MIDI ports opened."
         else:
-            xr18_input = _pick_port_name(args.xr18, input_names)
-            xr18_output = _pick_port_name(args.xr18, output_names)
-            mido_xr18 = MidoXR18Client(XR18Ports(xr18_input, xr18_output))
+            mido_xr18 = MidoXR18Client(XR18Ports(args.xr18), debug=port_debug)
             xr18 = mido_xr18
-            xr18_status = f"Connected XR18: {xr18_input} / {xr18_output}"
+            xr18_status = f"Watching XR18 MIDI ports matching {args.xr18!r}."
 
         assert xr18 is not None
         bridge = MixerBridge(xtouch, xr18, knob_step=args.knob_step)
         xtouch_debug = (lambda message: _debug_log("xtouch-router", message)) if args.debug_midi else None
         xtouch_router = XTouchMiniMessageRouter(bridge, debug=xtouch_debug)
-        threads = [_InputThread(xtouch.input_port, xtouch_router, name="xtouch-midi", debug=args.debug_midi)]
+        threads = [
+            _InputThread(
+                xtouch,
+                xtouch_router,
+                name="xtouch-midi",
+                on_connect=bridge.refresh_controller,
+                debug=args.debug_midi,
+            )
+        ]
 
         if mido_xr18 is not None:
             threads.append(
                 _InputThread(
-                    mido_xr18.input_port,
+                    mido_xr18,
                     XR18MessageRouter(bridge),
                     name="xr18-midi",
+                    on_connect=bridge.sync_mixer,
                     debug=args.debug_midi,
                 )
             )
@@ -605,7 +664,7 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
             xr18=xr18,
             threads=threads,
             status_messages=[
-                f"Connected X-Touch Mini: {xtouch_input} / {xtouch_output}",
+                f"Watching X-Touch Mini MIDI ports matching {args.xtouch!r}.",
                 xr18_status,
             ],
         )

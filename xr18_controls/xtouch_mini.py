@@ -7,6 +7,9 @@ from typing import Callable, Protocol
 
 import mido
 
+from xr18_controls.midi_ports import DebugLogger
+from xr18_controls.midi_ports import ReconnectableMidiIO
+
 
 KNOB_COUNT = 8
 BUTTON_COUNT = 16
@@ -89,31 +92,45 @@ class XTouchMiniClient(Protocol):
 
 @dataclass(frozen=True)
 class XTouchMiniPorts:
-    input_name: str
-    output_name: str
+    requested_name: str
 
 
 class MidoXTouchMiniClient:
     """MIDO-backed X-Touch Mini output client in Mackie Control mode."""
 
-    def __init__(self, ports: XTouchMiniPorts):
-        self._input = mido.open_input(ports.input_name)
-        try:
-            self._output = mido.open_output(ports.output_name)
-        except Exception:
-            self._input.close()
-            raise
+    def __init__(self, ports: XTouchMiniPorts, debug: DebugLogger | None = None):
+        self._io = ReconnectableMidiIO(
+            label="X-Touch Mini",
+            requested_name=ports.requested_name,
+            debug=debug,
+        )
 
     @property
-    def input_port(self) -> mido.ports.BaseInput:
-        return self._input
+    def connected(self) -> bool:
+        return self._io.connected
+
+    @property
+    def input_port(self):
+        return self._io.input_port
+
+    @property
+    def description(self) -> str:
+        return self._io.description
+
+    def connect(self) -> bool:
+        return self._io.connect()
+
+    def disconnect(self, reason: str | None = None) -> None:
+        self._io.disconnect(reason)
+
+    def check_connection(self) -> None:
+        self._io.check_connection()
 
     def close(self) -> None:
-        self._input.close()
-        self._output.close()
+        self._io.close()
 
-    def send(self, message: mido.Message) -> None:
-        self._output.send(message)
+    def send(self, message: mido.Message) -> bool:
+        return self._io.send(message)
 
     def set_mackie_mode(self) -> None:
         self.send(
