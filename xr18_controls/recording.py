@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import queue
 import random
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
@@ -16,6 +17,7 @@ DEFAULT_SAMPLE_RATE = 48_000
 DEFAULT_CHANNELS = 18
 DEFAULT_BLOCKSIZE = 1024
 DEFAULT_QUEUE_BLOCKS = 128
+DEFAULT_RECORDING_DIR_NAME = "XR18_Recordings"
 RECORDING_FORMAT = "RF64"
 RECORDING_SUBTYPE = "PCM_24"
 RECORDING_EXTENSION = ".wav"
@@ -374,11 +376,13 @@ class RecordingService:
         self._notifier.notify("XR18 recording started", f"{path.name} ({channel_text})")
         return True
 
-    def stop(self) -> None:
-        self._recorder.stop()
+    def stop(self, reveal: bool = True) -> None:
+        path = self._recorder.stop()
+        if reveal and path is not None:
+            reveal_recording(path, debug=self._recorder.debug)
 
     def close(self) -> None:
-        self.stop()
+        self.stop(reveal=False)
 
 
 class MultitrackRecorder:
@@ -416,6 +420,10 @@ class MultitrackRecorder:
     def recorded_channels(self) -> tuple[int, ...]:
         with self._lock:
             return self._recorded_channels
+
+    @property
+    def debug(self) -> DebugLogger | None:
+        return self._debug
 
     def start(self, active_channels: Sequence[int] | None = None) -> Path:
         with self._lock:
@@ -480,11 +488,11 @@ class MultitrackRecorder:
             self._log(f"Recording started: {path} ({_format_channel_list(recorded_channels)})")
             return path
 
-    def stop(self) -> None:
+    def stop(self) -> Path | None:
         with self._lock:
-            self._stop_locked()
+            return self._stop_locked()
 
-    def _stop_locked(self) -> None:
+    def _stop_locked(self) -> Path | None:
         stream = self._stream
         self._stream = None
         if stream is not None:
@@ -508,8 +516,9 @@ class MultitrackRecorder:
         if sound_file is not None:
             sound_file.close()
 
-        if self._current_file is not None:
-            self._log(f"Recording stopped: {self._current_file}")
+        stopped_file = self._current_file
+        if stopped_file is not None:
+            self._log(f"Recording stopped: {stopped_file}")
         self._current_file = None
         self._recorded_channels = ()
 
@@ -521,6 +530,7 @@ class MultitrackRecorder:
             error = self._callback_error
             self._callback_error = None
             raise RuntimeError(f"recording input failed: {error}") from error
+        return stopped_file
 
     def _audio_callback(self, indata, frames: int, time_info, status) -> None:
         if status:
@@ -592,6 +602,52 @@ def list_audio_input_devices() -> list[str]:
             hostapi = hostapis[int(device["hostapi"])]["name"]
             lines.append(f"{index}: {device['name']} ({input_channels} inputs, {hostapi})")
     return lines
+
+
+def default_recording_directory() -> Path:
+    if sys.platform == "win32":
+        return Path.home() / "Music" / DEFAULT_RECORDING_DIR_NAME
+    return Path.home() / DEFAULT_RECORDING_DIR_NAME
+
+
+def reveal_recording(path: Path, debug: DebugLogger | None = None) -> None:
+    try:
+        if sys.platform == "win32":
+            _popen(["explorer", f"/select,{path}"])
+            return
+        if sys.platform == "darwin":
+            _popen(["open", "-R", str(path)])
+            return
+        if _reveal_linux_file(path):
+            return
+        _popen(["xdg-open", str(path.parent)])
+    except Exception as error:
+        if debug is not None:
+            debug(f"Could not reveal recording {path}: {error}")
+
+
+def _reveal_linux_file(path: Path) -> bool:
+    uri = path.resolve().as_uri()
+    try:
+        _popen(
+            [
+                "dbus-send",
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                f"array:string:{uri}",
+                "string:",
+            ]
+        )
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _popen(command: list[str]) -> None:
+    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _pick_input_device(

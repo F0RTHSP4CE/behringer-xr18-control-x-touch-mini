@@ -17,6 +17,7 @@ from xr18_controls.recording import DEFAULT_SAMPLE_RATE
 from xr18_controls.recording import RecordingConfig
 from xr18_controls.recording import RecordingService
 from xr18_controls.recording import SystemNotifier
+from xr18_controls.recording import default_recording_directory
 from xr18_controls.recording import list_audio_input_devices
 from xr18_controls.xtouch_mini import (
     Layer,
@@ -396,12 +397,12 @@ class MixerBridge:
             self._state.recording_light_on = not self._state.recording_light_on
             self._refresh_record_button_locked()
 
-    def stop_recording(self) -> None:
+    def stop_recording(self, reveal: bool = True) -> None:
         if not self._recording.is_recording:
             return
 
         try:
-            self._recording.stop()
+            self._recording.stop(reveal=reveal)
         except Exception as error:
             self._log(f"recording stop failed: {error!r}")
 
@@ -697,7 +698,7 @@ class AppRuntime:
         for thread in self.threads:
             if thread.ident is not None:
                 thread.join(timeout=1)
-        self.bridge.stop_recording()
+        self.bridge.stop_recording(reveal=False)
         self.recording.close()
         self.xtouch.close()
         self.xr18.close()
@@ -708,7 +709,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xtouch", default="X-TOUCH MINI", help="X-Touch Mini port name or substring")
     parser.add_argument("--xr18", default="XR18", help="XR18 port name or substring")
     parser.add_argument("--knob-step", type=int, default=1, help="Fader step per X-Touch knob detent")
-    parser.add_argument("--record-dir", default="recordings", help="Directory for multitrack recordings")
+    parser.add_argument(
+        "--record-dir",
+        default=str(default_recording_directory()),
+        help="Directory for multitrack recordings",
+    )
     parser.add_argument(
         "--record-audio-device",
         default=None,

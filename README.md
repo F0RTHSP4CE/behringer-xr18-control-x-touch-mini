@@ -33,6 +33,13 @@ Press row 2, column 8 on the X-Touch Mini to start/stop recording. While recordi
 
 Recordings are written as multichannel RF64 WAV files at 48 kHz / 24-bit PCM by default. RF64 keeps CPU load low like normal WAV, but supports files larger than 4 GB.
 
+Default recording directories:
+
+- Linux: `~/XR18_Recordings`
+- Windows: `C:\Users\%USERNAME%\Music\XR18_Recordings`
+
+When recording is stopped from the controller, the recording folder opens with the created file selected when the platform file manager supports it.
+
 When recording starts, the script snapshots channel mute state and writes only unmuted channel strips. If a muted channel is unmuted later, it is not added to the active recording. Muting a channel after recording starts does not remove it from that recording.
 
 The script records from the XR18 USB audio device, not from MIDI. By default it searches for an audio device matching `X-AIR` and auto-picks the best match: most input channels first, then ASIO, WDM-KS, WASAPI, DirectSound, and MME.
