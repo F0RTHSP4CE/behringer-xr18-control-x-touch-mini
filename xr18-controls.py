@@ -247,15 +247,13 @@ class MixerBridge:
     def start(self) -> None:
         with self._lock:
             self._initialize_controller_locked()
-            self._sync_main_locked()
 
     def refresh_controller(self) -> None:
         with self._lock:
             self._initialize_controller_locked()
 
-    def sync_mixer(self) -> None:
-        with self._lock:
-            self._sync_main_locked()
+    def refresh_mixer(self) -> None:
+        self._log("mixer connected; waiting for mixer/controller fader updates before sending main/DCA")
 
     def on_knob_turn(self, knob: int, delta: int) -> None:
         with self._lock:
@@ -808,7 +806,7 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
                     mido_xr18,
                     XR18MessageRouter(bridge),
                     name="xr18-midi",
-                    on_connect=bridge.sync_mixer,
+                    on_connect=bridge.refresh_mixer,
                     debug=args.debug_midi,
                 )
             )
