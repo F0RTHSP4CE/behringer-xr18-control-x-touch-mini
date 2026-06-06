@@ -40,9 +40,11 @@ Default recording directories:
 
 When recording is stopped from the controller, the recording folder opens with the created file selected when the platform file manager supports it.
 
+If the USB audio stream fails while recording, the script stops recording, finalizes the partial file, turns off the blinking record light, shows a stop notification, and opens the recording location.
+
 When recording starts, the script snapshots channel mute state and writes only unmuted channel strips. If a muted channel is unmuted later, it is not added to the active recording. Muting a channel after recording starts does not remove it from that recording.
 
-The script records from the XR18 USB audio device, not from MIDI. By default it searches for an audio device matching `X-AIR` and auto-picks the best match: most input channels first, then ASIO, WDM-KS, WASAPI, DirectSound, and MME.
+The script records from the XR18 USB audio device, not from MIDI. By default it searches for an ASIO audio device matching `X-AIR` with at least 18 inputs. Non-ASIO devices and devices with fewer than 18 inputs are discarded for recording.
 
 List available audio inputs and their host APIs:
 
@@ -50,26 +52,25 @@ List available audio inputs and their host APIs:
 uv run xr18-controls.py --list-audio-devices
 ```
 
-On Windows the script enables `sounddevice`'s ASIO-capable PortAudio DLL before listing or recording devices. If an ASIO driver is installed and visible to PortAudio, it should appear in this list.
+On Windows the script enables `sounddevice`'s ASIO-capable PortAudio DLL before listing or recording devices. If an ASIO driver is installed and visible to PortAudio, it should appear in this list as a recording candidate.
 
-If an ASIO device is available, you can force ASIO:
+ASIO is the default, but you can still be explicit:
 
 ```
 uv run xr18-controls.py --record-hostapi ASIO --record-audio-device "X-AIR"
 ```
 
-If you need to target a specific device, pass its numeric index:
+If you need to target a specific ASIO device, pass its numeric index:
 
 ```
 uv run xr18-controls.py --record-audio-device 52
 ```
 
-To force one of the Windows host APIs from the device list:
+Backend JACK/PortAudio probe warnings are hidden by default. To show native backend diagnostics:
 
 ```
-uv run xr18-controls.py --record-hostapi "Windows WDM-KS"
+set XR18_AUDIO_BACKEND_DEBUG=1
+set XR18_MIDI_BACKEND_DEBUG=1
 ```
-
-If the chosen device is `IN 1-8`, the script captures inputs 1-8 and writes only the unmuted channels among those inputs. Channels 9-16 cannot be recorded from an 8-input WDM/WASAPI-style device.
 
 Recording filenames include the date/time plus random words, for example `2026-06-06_21-30-12_river-signal.wav`.

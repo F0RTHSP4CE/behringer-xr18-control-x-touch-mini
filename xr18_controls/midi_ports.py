@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
+import os
+import sys
 
 import mido
 
@@ -45,8 +48,9 @@ class ReconnectableMidiIO:
             return False
 
         try:
-            input_names = mido.get_input_names()
-            output_names = mido.get_output_names()
+            with _quiet_backend_stderr():
+                input_names = mido.get_input_names()
+                output_names = mido.get_output_names()
         except Exception as error:
             self._log_status(f"{self._label} port scan failed: {error}")
             return False
@@ -57,8 +61,9 @@ class ReconnectableMidiIO:
             return False
 
         try:
-            input_port = mido.open_input(input_name)
-            output_port = mido.open_output(output_name)
+            with _quiet_backend_stderr():
+                input_port = mido.open_input(input_name)
+                output_port = mido.open_output(output_name)
         except Exception as error:
             self._close_port(input_port if "input_port" in locals() else None)
             self._close_port(output_port if "output_port" in locals() else None)
@@ -91,8 +96,9 @@ class ReconnectableMidiIO:
             return
 
         try:
-            input_names = mido.get_input_names()
-            output_names = mido.get_output_names()
+            with _quiet_backend_stderr():
+                input_names = mido.get_input_names()
+                output_names = mido.get_output_names()
         except Exception as error:
             self.disconnect(f"port scan failed: {error}")
             return
@@ -161,3 +167,26 @@ class ReconnectableMidiIO:
             port.close()
         except Exception:
             pass
+
+
+@contextmanager
+def _quiet_backend_stderr():
+    if os.environ.get("XR18_MIDI_BACKEND_DEBUG"):
+        yield
+        return
+
+    try:
+        stderr_fd = sys.stderr.fileno()
+        saved_fd = os.dup(stderr_fd)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except Exception:
+        yield
+        return
+
+    try:
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved_fd, stderr_fd)
+        os.close(saved_fd)
+        os.close(devnull_fd)

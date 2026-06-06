@@ -13,6 +13,7 @@ import mido
 
 from xr18_controls.recording import DEFAULT_BLOCKSIZE
 from xr18_controls.recording import DEFAULT_CHANNELS
+from xr18_controls.recording import DEFAULT_HOSTAPI
 from xr18_controls.recording import DEFAULT_SAMPLE_RATE
 from xr18_controls.recording import RecordingConfig
 from xr18_controls.recording import RecordingService
@@ -391,6 +392,15 @@ class MixerBridge:
             self._state.main.muted = muted
 
     def pulse_recording_light(self) -> None:
+        result = self._recording.stop_if_failed()
+        if result is not None:
+            self._log(f"recording stopped after audio failure: {result.error}")
+            with self._lock:
+                self._state.recording_active = False
+                self._state.recording_light_on = False
+                self._refresh_record_button_locked()
+            return
+
         with self._lock:
             if not self._state.recording_active:
                 return
@@ -722,13 +732,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-hostapi",
         default=_default_record_hostapi(),
-        help="Audio host API name or substring. Omit to auto-pick the best matching input device.",
+        help=f"Audio host API name or substring (default: {DEFAULT_HOSTAPI})",
     )
     parser.add_argument(
         "--record-channels",
         type=int,
         default=DEFAULT_CHANNELS,
-        help="XR18 USB input channel count to inspect; omit to use the selected device input count",
+        help=f"XR18 USB input channel count to require (default: {DEFAULT_CHANNELS})",
     )
     parser.add_argument("--record-sample-rate", type=int, default=DEFAULT_SAMPLE_RATE, help="Recording sample rate")
     parser.add_argument("--record-blocksize", type=int, default=DEFAULT_BLOCKSIZE, help="Audio callback block size")
@@ -827,8 +837,10 @@ def _open_runtime(args: argparse.Namespace) -> AppRuntime:
                 f"Watching X-Touch Mini MIDI ports matching {args.xtouch!r}.",
                 xr18_status,
                 f"Recordings: {Path(args.record_dir)}",
-                f"Recording audio device: {args.record_audio_device or DEFAULT_RECORD_AUDIO_DEVICE!r}",
-                f"Recording host API: {args.record_hostapi or 'any'}",
+                (
+                    f"Recording policy: device {args.record_audio_device or DEFAULT_RECORD_AUDIO_DEVICE!r}, "
+                    f"host API {args.record_hostapi or 'any'}, minimum inputs {args.record_channels or 'any'}"
+                ),
             ],
         )
     except Exception:
@@ -878,7 +890,7 @@ def _debug_log(source: str, message: str) -> None:
 
 
 def _default_record_hostapi() -> str | None:
-    return None
+    return DEFAULT_HOSTAPI
 
 
 if __name__ == "__main__":

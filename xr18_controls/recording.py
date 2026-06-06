@@ -6,6 +6,7 @@ import random
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +16,7 @@ from typing import Any
 
 DEFAULT_SAMPLE_RATE = 48_000
 DEFAULT_CHANNELS = 18
+DEFAULT_HOSTAPI = "ASIO"
 DEFAULT_BLOCKSIZE = 1024
 DEFAULT_QUEUE_BLOCKS = 128
 DEFAULT_RECORDING_DIR_NAME = "XR18_Recordings"
@@ -312,11 +314,17 @@ RECORDING_WORDS = (
 class RecordingConfig:
     directory: Path
     audio_device: str
-    hostapi: str | None = None
+    hostapi: str | None = DEFAULT_HOSTAPI
     channels: int | None = DEFAULT_CHANNELS
     sample_rate: int = DEFAULT_SAMPLE_RATE
     blocksize: int = DEFAULT_BLOCKSIZE
     queue_blocks: int = DEFAULT_QUEUE_BLOCKS
+
+
+@dataclass(frozen=True)
+class RecordingStopResult:
+    path: Path | None
+    error: BaseException | None = None
 
 
 class SystemNotifier:
@@ -376,10 +384,20 @@ class RecordingService:
         self._notifier.notify("XR18 recording started", f"{path.name} ({channel_text})")
         return True
 
-    def stop(self, reveal: bool = True) -> None:
-        path = self._recorder.stop()
-        if reveal and path is not None:
-            reveal_recording(path, debug=self._recorder.debug)
+    def stop(self, reveal: bool = True, reason: str | None = None) -> RecordingStopResult:
+        result = self._recorder.stop()
+        if reveal and result.path is not None:
+            reveal_recording(result.path, debug=self._recorder.debug)
+        if result.path is not None and (reason is not None or result.error is not None):
+            message = reason or f"Recording stopped: {_format_error(result.error)}"
+            self._notifier.notify("XR18 recording stopped", f"{result.path.name} ({message})")
+        return result
+
+    def stop_if_failed(self) -> RecordingStopResult | None:
+        error = self._recorder.async_error
+        if error is None:
+            return None
+        return self.stop(reveal=True, reason=f"audio input failed: {_format_error(error)}")
 
     def close(self) -> None:
         self.stop(reveal=False)
@@ -405,6 +423,8 @@ class MultitrackRecorder:
         self._recorded_channels: tuple[int, ...] = ()
         self._writer_error: BaseException | None = None
         self._callback_error: BaseException | None = None
+        self._stream_error: BaseException | None = None
+        self._stopping = False
 
     @property
     def is_recording(self) -> bool:
@@ -425,6 +445,10 @@ class MultitrackRecorder:
     def debug(self) -> DebugLogger | None:
         return self._debug
 
+    @property
+    def async_error(self) -> BaseException | None:
+        return self._writer_error or self._callback_error or self._stream_error
+
     def start(self, active_channels: Sequence[int] | None = None) -> Path:
         with self._lock:
             if self._stream is not None:
@@ -440,6 +464,7 @@ class MultitrackRecorder:
                 self._config.hostapi,
                 self._config.channels,
             )
+            device_description = _describe_input_device(sd, device_index)
             recorded_channels = _normalize_recorded_channels(active_channels, capture_channels)
             output_channels = len(recorded_channels)
             channel_indices = tuple(channel - 1 for channel in recorded_channels)
@@ -460,6 +485,8 @@ class MultitrackRecorder:
             self._recorded_channels = recorded_channels
             self._writer_error = None
             self._callback_error = None
+            self._stream_error = None
+            self._stopping = False
 
             writer_thread = threading.Thread(
                 target=self._write_audio,
@@ -478,6 +505,7 @@ class MultitrackRecorder:
                     blocksize=self._config.blocksize,
                     dtype="int32",
                     callback=self._audio_callback,
+                    finished_callback=self._stream_finished,
                 )
                 self._stream = stream
                 stream.start()
@@ -485,21 +513,29 @@ class MultitrackRecorder:
                 self._stop_locked()
                 raise
 
+            self._log(
+                f"Recording input: {device_description}; capture inputs={capture_channels}; "
+                f"file channels={output_channels}"
+            )
             self._log(f"Recording started: {path} ({_format_channel_list(recorded_channels)})")
             return path
 
-    def stop(self) -> Path | None:
+    def stop(self) -> RecordingStopResult:
         with self._lock:
             return self._stop_locked()
 
-    def _stop_locked(self) -> Path | None:
+    def _stop_locked(self) -> RecordingStopResult:
         stream = self._stream
         self._stream = None
         if stream is not None:
+            self._stopping = True
             try:
-                stream.stop()
+                try:
+                    stream.stop()
+                finally:
+                    stream.close()
             finally:
-                stream.close()
+                self._stopping = False
 
         audio_queue = self._queue
         self._queue = None
@@ -522,15 +558,13 @@ class MultitrackRecorder:
         self._current_file = None
         self._recorded_channels = ()
 
-        if self._writer_error is not None:
-            error = self._writer_error
-            self._writer_error = None
-            raise RuntimeError(f"recording writer failed: {error}") from error
-        if self._callback_error is not None:
-            error = self._callback_error
-            self._callback_error = None
-            raise RuntimeError(f"recording input failed: {error}") from error
-        return stopped_file
+        error = self.async_error
+        self._writer_error = None
+        self._callback_error = None
+        self._stream_error = None
+        if error is not None:
+            self._log(f"Recording stopped after error: {_format_error(error)}")
+        return RecordingStopResult(stopped_file, error)
 
     def _audio_callback(self, indata, frames: int, time_info, status) -> None:
         if status:
@@ -543,8 +577,14 @@ class MultitrackRecorder:
         try:
             audio_queue.put_nowait(indata.copy())
         except queue.Full as error:
-            self._callback_error = error
+            self._callback_error = RuntimeError("audio queue overflow")
             raise
+
+    def _stream_finished(self) -> None:
+        if self._stopping or self._stream is None:
+            return
+        if self._stream_error is None:
+            self._stream_error = RuntimeError("audio input stream stopped unexpectedly")
 
     def _write_audio(
         self,
@@ -593,14 +633,16 @@ class MultitrackRecorder:
 
 def list_audio_input_devices() -> list[str]:
     sd, _ = _load_audio_modules()
-    devices = sd.query_devices()
-    hostapis = sd.query_hostapis()
+    with _quiet_backend_stderr():
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
     lines = []
     for index, device in enumerate(devices):
         input_channels = int(device.get("max_input_channels", 0))
         if input_channels > 0:
             hostapi = hostapis[int(device["hostapi"])]["name"]
-            lines.append(f"{index}: {device['name']} ({input_channels} inputs, {hostapi})")
+            status = _recording_device_status(device, hostapis)
+            lines.append(f"{index}: {device['name']} ({input_channels} inputs, {hostapi}) [{status}]")
     return lines
 
 
@@ -656,8 +698,9 @@ def _pick_input_device(
     requested_hostapi: str | None,
     channels: int | None,
 ) -> tuple[int | None, int]:
-    devices = sd.query_devices()
-    hostapis = sd.query_hostapis()
+    with _quiet_backend_stderr():
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
 
     requested = requested_name.strip()
     if requested.isdigit():
@@ -666,6 +709,11 @@ def _pick_input_device(
             device = devices[index]
         except IndexError as error:
             raise RuntimeError(f"No audio input device with index {index}") from error
+        if not _hostapi_matches(device, hostapis, requested_hostapi):
+            hostapi = hostapis[int(device["hostapi"])]["name"]
+            raise RuntimeError(
+                f"Audio device {index} uses {hostapi}, but {requested_hostapi} is required"
+            )
         return index, _capture_channel_count(index, device, channels)
 
     candidates = [
@@ -720,6 +768,17 @@ def _device_has_enough_inputs(device, channels: int | None) -> bool:
     return max_input_channels >= channels
 
 
+def _recording_device_status(device, hostapis) -> str:
+    reasons = []
+    if not _hostapi_matches(device, hostapis, DEFAULT_HOSTAPI):
+        reasons.append(f"not {DEFAULT_HOSTAPI}")
+    if not _device_has_enough_inputs(device, DEFAULT_CHANNELS):
+        reasons.append(f"needs {DEFAULT_CHANNELS} inputs")
+    if reasons:
+        return "discarded: " + ", ".join(reasons)
+    return "recording candidate"
+
+
 def _hostapi_matches(device, hostapis, requested_hostapi: str | None) -> bool:
     if requested_hostapi is None:
         return True
@@ -759,6 +818,17 @@ def _capture_channel_count(index: int, device, channels: int | None) -> int:
     return channels
 
 
+def _describe_input_device(sd, index: int | None) -> str:
+    if index is None:
+        return "default input device"
+    with _quiet_backend_stderr():
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    device = devices[index]
+    hostapi = hostapis[int(device["hostapi"])]["name"]
+    return f"{index}: {device['name']} ({device['max_input_channels']} inputs, {hostapi})"
+
+
 def _random_words() -> tuple[str, ...]:
     rng = random.SystemRandom()
     count = rng.randint(2, 3)
@@ -791,15 +861,48 @@ def _format_channel_list(channels: Sequence[int]) -> str:
     return "channels " + ", ".join(str(channel) for channel in channels)
 
 
+def _format_error(error: BaseException | None) -> str:
+    if error is None:
+        return "unknown error"
+    text = str(error)
+    if text:
+        return text
+    return error.__class__.__name__
+
+
 def _load_audio_modules():
     if sys.platform == "win32":
         os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
     try:
-        import sounddevice as sd
+        with _quiet_backend_stderr():
+            import sounddevice as sd
         import soundfile as sf
     except Exception as error:
         raise RuntimeError(
             "Recording requires sounddevice and soundfile. Install project dependencies with uv sync."
         ) from error
     return sd, sf
+
+
+@contextmanager
+def _quiet_backend_stderr():
+    if os.environ.get("XR18_AUDIO_BACKEND_DEBUG"):
+        yield
+        return
+
+    try:
+        stderr_fd = sys.stderr.fileno()
+        saved_fd = os.dup(stderr_fd)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except Exception:
+        yield
+        return
+
+    try:
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved_fd, stderr_fd)
+        os.close(saved_fd)
+        os.close(devnull_fd)
