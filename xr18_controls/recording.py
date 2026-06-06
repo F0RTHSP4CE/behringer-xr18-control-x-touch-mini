@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import random
 import sys
@@ -19,6 +20,13 @@ RECORDING_FORMAT = "RF64"
 RECORDING_SUBTYPE = "PCM_24"
 RECORDING_EXTENSION = ".wav"
 STOP_WRITER = object()
+HOSTAPI_PRIORITY = (
+    "ASIO",
+    "Windows WDM-KS",
+    "Windows WASAPI",
+    "Windows DirectSound",
+    "MME",
+)
 
 DebugLogger = Callable[[str], None]
 
@@ -615,7 +623,7 @@ def _pick_input_device(
         index for index, device in candidates if str(device["name"]).lower() == requested.lower()
     ]
     if exact_matches:
-        index = exact_matches[0]
+        index = _best_device_match(exact_matches, devices, hostapis)
         return index, _capture_channel_count(index, devices[index], channels)
 
     requested_lower = requested.lower()
@@ -625,31 +633,28 @@ def _pick_input_device(
         if requested_lower in str(device["name"]).lower()
         or requested_lower in str(hostapis[int(device["hostapi"])]["name"]).lower()
     ]
-    if len(matches) == 1:
-        index = matches[0]
+    if matches:
+        index = _best_device_match(matches, devices, hostapis)
         return index, _capture_channel_count(index, devices[index], channels)
-    if not matches:
-        available = ", ".join(
-            f"{index}: {device['name']} ({device['max_input_channels']} inputs)"
-            for index, device in candidates
-        )
-        channel_text = (
-            "any input channel count"
-            if channels is None
-            else f"at least {channels} channels"
-        )
-        hostapi_text = (
-            ""
-            if requested_hostapi is None
-            else f" on a host API matching {requested_hostapi!r}"
-        )
-        raise RuntimeError(
-            f"No audio input device matching {requested_name!r}{hostapi_text} with {channel_text}. "
-            f"Available: {available or 'none'}"
-        )
 
-    names = ", ".join(str(devices[index]["name"]) for index in matches)
-    raise RuntimeError(f"Multiple audio input devices match {requested_name!r}: {names}")
+    available = ", ".join(
+        f"{index}: {device['name']} ({device['max_input_channels']} inputs)"
+        for index, device in candidates
+    )
+    channel_text = (
+        "any input channel count"
+        if channels is None
+        else f"at least {channels} channels"
+    )
+    hostapi_text = (
+        ""
+        if requested_hostapi is None
+        else f" on a host API matching {requested_hostapi!r}"
+    )
+    raise RuntimeError(
+        f"No audio input device matching {requested_name!r}{hostapi_text} with {channel_text}. "
+        f"Available: {available or 'none'}"
+    )
 
 
 def _device_has_enough_inputs(device, channels: int | None) -> bool:
@@ -664,6 +669,25 @@ def _hostapi_matches(device, hostapis, requested_hostapi: str | None) -> bool:
         return True
     hostapi_name = str(hostapis[int(device["hostapi"])]["name"]).lower()
     return requested_hostapi.lower() in hostapi_name
+
+
+def _best_device_match(indices: list[int], devices, hostapis) -> int:
+    return max(
+        indices,
+        key=lambda index: (
+            int(devices[index].get("max_input_channels", 0)),
+            -_hostapi_priority(str(hostapis[int(devices[index]["hostapi"])]["name"])),
+            -index,
+        ),
+    )
+
+
+def _hostapi_priority(hostapi_name: str) -> int:
+    lowered = hostapi_name.lower()
+    for priority, preferred in enumerate(HOSTAPI_PRIORITY):
+        if preferred.lower() in lowered:
+            return priority
+    return len(HOSTAPI_PRIORITY)
 
 
 def _capture_channel_count(index: int, device, channels: int | None) -> int:
@@ -712,6 +736,9 @@ def _format_channel_list(channels: Sequence[int]) -> str:
 
 
 def _load_audio_modules():
+    if sys.platform == "win32":
+        os.environ.setdefault("SD_ENABLE_ASIO", "1")
+
     try:
         import sounddevice as sd
         import soundfile as sf

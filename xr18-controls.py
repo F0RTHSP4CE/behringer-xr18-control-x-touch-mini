@@ -54,7 +54,6 @@ RECONNECT_INTERVAL = 1.0
 CONNECTION_CHECK_INTERVAL = 1.0
 RECORD_BUTTON_BLINK_INTERVAL = 0.5
 DEFAULT_RECORD_AUDIO_DEVICE = "X-AIR"
-DEFAULT_WINDOWS_RECORD_HOSTAPI = "ASIO"
 
 
 def _validate_index(name: str, value: int, count: int) -> None:
@@ -720,7 +719,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-hostapi",
         default=_default_record_hostapi(),
-        help="Audio host API name or substring. Defaults to ASIO on Windows; pass an empty value to search all.",
+        help="Audio host API name or substring. Omit to auto-pick the best matching input device.",
     )
     parser.add_argument(
         "--record-channels",
@@ -876,8 +875,6 @@ def _debug_log(source: str, message: str) -> None:
 
 
 def _default_record_hostapi() -> str | None:
-    if sys.platform == "win32":
-        return DEFAULT_WINDOWS_RECORD_HOSTAPI
     return None
 
 
