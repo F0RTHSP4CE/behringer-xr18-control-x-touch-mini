@@ -1,0 +1,908 @@
+from __future__ import annotations
+
+import os
+import queue
+import random
+import subprocess
+import sys
+import threading
+from contextlib import contextmanager
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_SAMPLE_RATE = 48_000
+DEFAULT_CHANNELS = 18
+DEFAULT_HOSTAPI = "ASIO"
+DEFAULT_BLOCKSIZE = 1024
+DEFAULT_QUEUE_BLOCKS = 128
+DEFAULT_RECORDING_DIR_NAME = "XR18_Recordings"
+RECORDING_FORMAT = "RF64"
+RECORDING_SUBTYPE = "PCM_24"
+RECORDING_EXTENSION = ".wav"
+STOP_WRITER = object()
+HOSTAPI_PRIORITY = (
+    "ASIO",
+    "Windows WDM-KS",
+    "Windows WASAPI",
+    "Windows DirectSound",
+    "MME",
+)
+
+DebugLogger = Callable[[str], None]
+
+RECORDING_WORDS = (
+    "amber",
+    "apex",
+    "atlas",
+    "aurora",
+    "blue",
+    "bright",
+    "cedar",
+    "clear",
+    "cloud",
+    "coral",
+    "delta",
+    "ember",
+    "field",
+    "flare",
+    "forest",
+    "glow",
+    "gold",
+    "harbor",
+    "horizon",
+    "iron",
+    "jade",
+    "lake",
+    "lunar",
+    "maple",
+    "meadow",
+    "metro",
+    "midnight",
+    "north",
+    "nova",
+    "ocean",
+    "orbit",
+    "pine",
+    "plain",
+    "pulse",
+    "river",
+    "silver",
+    "signal",
+    "sky",
+    "solar",
+    "stone",
+    "summit",
+    "sunset",
+    "tempo",
+    "trail",
+    "velvet",
+    "violet",
+    "wave",
+    "winter",
+    # Hacker dictionary
+    "admin",
+    "backdoor",
+    "binary",
+    "blockchain",
+    "buffer",
+    "bytecode",
+    "cache",
+    "cipher",
+    "cli",
+    "cluster",
+    "codec",
+    "compile",
+    "crypto",
+    "daemon",
+    "debug",
+    "decrypt",
+    "deploy",
+    "devops",
+    "exploit",
+    "firewall",
+    "firmware",
+    "flux",
+    "gateway",
+    "git",
+    "gitlab",
+    "gitlab",
+    "grep",
+    "hash",
+    "hexadecimal",
+    "idle",
+    "input",
+    "kernel",
+    "keylogger",
+    "lambda",
+    "libexec",
+    "linux",
+    "localhost",
+    "malware",
+    "matrix",
+    "memory",
+    "metasploit",
+    "minify",
+    "module",
+    "mongodb",
+    "mutex",
+    "netcat",
+    "nginx",
+    "nmap",
+    "node",
+    "null",
+    "obfuscate",
+    "opcode",
+    "packet",
+    "payload",
+    "pbx",
+    "php",
+    "postgres",
+    "proxy",
+    "putty",
+    "recursion",
+    "redis",
+    "regex",
+    "registry",
+    "replicat",
+    "router",
+    "runtime",
+    "sandbox",
+    "script",
+    "sdk",
+    "segment",
+    "server",
+    "shell",
+    "shellcode",
+    "socket",
+    "source",
+    "ssh",
+    "ssl",
+    "stack",
+    "stdin",
+    "stdout",
+    "subnet",
+    "sudo",
+    "swamp",
+    "syntax",
+    "syslog",
+    "tcp",
+    "terminal",
+    "thread",
+    "token",
+    "trace",
+    "tunnel",
+    "udp",
+    "unix",
+    "vector",
+    "vendor",
+    "verbose",
+    "virus",
+    "volatile",
+    "wasm",
+    "webhook",
+    "wifi",
+    "xss",
+    "yaml",
+    "zombie",
+    # Music memes
+    "bass",
+    "beat",
+    "bop",
+    "breakcore",
+    "drop",
+    "dubstep",
+    "drum",
+    "edm",
+    "epic",
+    "euphoria",
+    "festival",
+    "funk",
+    "groove",
+    "heavy",
+    "lfo",
+    "lo-fi",
+    "meme",
+    "metalcore",
+    "midtempo",
+    "mixtape",
+    "remix",
+    "reverb",
+    "sick",
+    "slap",
+    "sound",
+    "synth",
+    "vibe",
+    "vibraphone",
+    "vinyl",
+    "waveform",
+    # Random unique words
+    "abyss",
+    "absurd",
+    "acid",
+    "acrid",
+    "acrobat",
+    "acute",
+    "adage",
+    "adapt",
+    "addax",
+    "adder",
+    "addict",
+    "addle",
+    "adeem",
+    "adept",
+    "adieu",
+    "adipose",
+    "adjoin",
+    "adjourn",
+    "adjudge",
+    "adjunct",
+    "adjure",
+    "adjust",
+    "adjutant",
+    "admire",
+    "admit",
+    "admix",
+    "admonish",
+    "adobe",
+    "adonize",
+    "adopt",
+    "adore",
+    "adorn",
+    "adult",
+    "adust",
+    "advent",
+    "adverb",
+    "adverse",
+    "advert",
+    "advice",
+    "advise",
+    "advocate",
+    "adze",
+    "aegis",
+    "aeon",
+    "aerate",
+    "aerial",
+    "aerie",
+    "aery",
+    "afar",
+    "affable",
+    "affair",
+    "affect",
+    "affiche",
+    "affied",
+    "affies",
+    "affinal",
+    "affined",
+    "affinal",
+    "affinity",
+    "affirm",
+    "affix",
+    "afflatus",
+    "afflict",
+    "afflux",
+    "afford",
+    "afforest",
+    "affray",
+    "affront",
+    "affuse",
+    "afghan",
+    "afire",
+    "aflame",
+    "afloat",
+    "aflutter",
+    "afoot",
+    "afore",
+    "aforementioned",
+    "afoul",
+    "afraid",
+    "afresh",
+    "afrit",
+    "aft",
+    "after",
+    "afters",
+    "afterday",
+    "afterglow",
+    "aftermath",
+)
+
+
+@dataclass(frozen=True)
+class RecordingConfig:
+    directory: Path
+    audio_device: str
+    hostapi: str | None = DEFAULT_HOSTAPI
+    channels: int | None = DEFAULT_CHANNELS
+    sample_rate: int = DEFAULT_SAMPLE_RATE
+    blocksize: int = DEFAULT_BLOCKSIZE
+    queue_blocks: int = DEFAULT_QUEUE_BLOCKS
+
+
+@dataclass(frozen=True)
+class RecordingStopResult:
+    path: Path | None
+    error: BaseException | None = None
+
+
+class SystemNotifier:
+    def __init__(self, debug: DebugLogger | None = None):
+        self._debug = debug
+
+    def notify(self, title: str, message: str) -> None:
+        if sys.platform == "win32" and self._notify_windows(title, message):
+            return
+
+        self._log(f"{title}: {message}")
+
+    def _notify_windows(self, title: str, message: str) -> bool:
+        try:
+            from winotify import Notification
+        except Exception as error:
+            self._log(f"Windows notification unavailable: {error}")
+            return False
+
+        try:
+            Notification(app_id="XR18 Controls", title=title, msg=message).show()
+        except Exception as error:
+            self._log(f"Windows notification failed: {error}")
+            return False
+        return True
+
+    def _log(self, message: str) -> None:
+        if self._debug is not None:
+            self._debug(message)
+
+
+class RecordingService:
+    def __init__(
+        self,
+        config: RecordingConfig,
+        notifier: SystemNotifier,
+        debug: DebugLogger | None = None,
+    ):
+        self._recorder = MultitrackRecorder(config, debug=debug)
+        self._notifier = notifier
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder.is_recording
+
+    @property
+    def current_file(self) -> Path | None:
+        return self._recorder.current_file
+
+    def toggle(self, active_channels: Sequence[int] | None = None) -> bool:
+        if self.is_recording:
+            self.stop()
+            return False
+
+        path = self._recorder.start(active_channels)
+        channel_text = _format_channel_list(self._recorder.recorded_channels)
+        self._notifier.notify("XR18 recording started", f"{path.name} ({channel_text})")
+        return True
+
+    def stop(self, reveal: bool = True, reason: str | None = None) -> RecordingStopResult:
+        result = self._recorder.stop()
+        if reveal and result.path is not None:
+            reveal_recording(result.path, debug=self._recorder.debug)
+        if result.path is not None and (reason is not None or result.error is not None):
+            message = reason or f"Recording stopped: {_format_error(result.error)}"
+            self._notifier.notify("XR18 recording stopped", f"{result.path.name} ({message})")
+        return result
+
+    def stop_if_failed(self) -> RecordingStopResult | None:
+        error = self._recorder.async_error
+        if error is None:
+            return None
+        return self.stop(reveal=True, reason=f"audio input failed: {_format_error(error)}")
+
+    def close(self) -> None:
+        self.stop(reveal=False)
+
+
+class MultitrackRecorder:
+    def __init__(self, config: RecordingConfig, debug: DebugLogger | None = None):
+        if config.channels is not None and config.channels < 1:
+            raise ValueError("recording channels must be at least 1")
+        if config.sample_rate < 1:
+            raise ValueError("recording sample rate must be positive")
+        if config.blocksize < 1:
+            raise ValueError("recording blocksize must be positive")
+
+        self._config = config
+        self._debug = debug
+        self._lock = threading.Lock()
+        self._stream: Any | None = None
+        self._sound_file: Any | None = None
+        self._writer_thread: threading.Thread | None = None
+        self._queue: queue.Queue[Any] | None = None
+        self._current_file: Path | None = None
+        self._recorded_channels: tuple[int, ...] = ()
+        self._writer_error: BaseException | None = None
+        self._callback_error: BaseException | None = None
+        self._stream_error: BaseException | None = None
+        self._stopping = False
+
+    @property
+    def is_recording(self) -> bool:
+        with self._lock:
+            return self._stream is not None
+
+    @property
+    def current_file(self) -> Path | None:
+        with self._lock:
+            return self._current_file
+
+    @property
+    def recorded_channels(self) -> tuple[int, ...]:
+        with self._lock:
+            return self._recorded_channels
+
+    @property
+    def debug(self) -> DebugLogger | None:
+        return self._debug
+
+    @property
+    def async_error(self) -> BaseException | None:
+        return self._writer_error or self._callback_error or self._stream_error
+
+    def start(self, active_channels: Sequence[int] | None = None) -> Path:
+        with self._lock:
+            if self._stream is not None:
+                assert self._current_file is not None
+                return self._current_file
+
+            sd, sf = _load_audio_modules()
+            self._config.directory.mkdir(parents=True, exist_ok=True)
+            path = self._next_recording_path()
+            device_index, capture_channels = _pick_input_device(
+                sd,
+                self._config.audio_device,
+                self._config.hostapi,
+                self._config.channels,
+            )
+            device_description = _describe_input_device(sd, device_index)
+            recorded_channels = _normalize_recorded_channels(active_channels, capture_channels)
+            output_channels = len(recorded_channels)
+            channel_indices = tuple(channel - 1 for channel in recorded_channels)
+            audio_queue: queue.Queue[Any] = queue.Queue(maxsize=self._config.queue_blocks)
+
+            sound_file = sf.SoundFile(
+                path,
+                mode="w",
+                samplerate=self._config.sample_rate,
+                channels=output_channels,
+                format=RECORDING_FORMAT,
+                subtype=RECORDING_SUBTYPE,
+            )
+
+            self._queue = audio_queue
+            self._sound_file = sound_file
+            self._current_file = path
+            self._recorded_channels = recorded_channels
+            self._writer_error = None
+            self._callback_error = None
+            self._stream_error = None
+            self._stopping = False
+
+            writer_thread = threading.Thread(
+                target=self._write_audio,
+                args=(audio_queue, sound_file, channel_indices),
+                name="recording-writer",
+                daemon=True,
+            )
+            writer_thread.start()
+            self._writer_thread = writer_thread
+
+            try:
+                stream = sd.InputStream(
+                    samplerate=self._config.sample_rate,
+                    device=device_index,
+                    channels=capture_channels,
+                    blocksize=self._config.blocksize,
+                    dtype="int32",
+                    callback=self._audio_callback,
+                    finished_callback=self._stream_finished,
+                )
+                self._stream = stream
+                stream.start()
+            except Exception:
+                self._stop_locked()
+                raise
+
+            self._log(
+                f"Recording input: {device_description}; capture inputs={capture_channels}; "
+                f"file channels={output_channels}"
+            )
+            self._log(f"Recording started: {path} ({_format_channel_list(recorded_channels)})")
+            return path
+
+    def stop(self) -> RecordingStopResult:
+        with self._lock:
+            return self._stop_locked()
+
+    def _stop_locked(self) -> RecordingStopResult:
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            self._stopping = True
+            try:
+                try:
+                    stream.stop()
+                finally:
+                    stream.close()
+            finally:
+                self._stopping = False
+
+        audio_queue = self._queue
+        self._queue = None
+        if audio_queue is not None:
+            self._request_writer_stop(audio_queue)
+
+        writer_thread = self._writer_thread
+        self._writer_thread = None
+        if writer_thread is not None:
+            writer_thread.join()
+
+        sound_file = self._sound_file
+        self._sound_file = None
+        if sound_file is not None:
+            sound_file.close()
+
+        stopped_file = self._current_file
+        if stopped_file is not None:
+            self._log(f"Recording stopped: {stopped_file}")
+        self._current_file = None
+        self._recorded_channels = ()
+
+        error = self.async_error
+        self._writer_error = None
+        self._callback_error = None
+        self._stream_error = None
+        if error is not None:
+            self._log(f"Recording stopped after error: {_format_error(error)}")
+        return RecordingStopResult(stopped_file, error)
+
+    def _audio_callback(self, indata, frames: int, time_info, status) -> None:
+        if status:
+            self._log(f"Recording input status: {status}")
+
+        audio_queue = self._queue
+        if audio_queue is None:
+            return
+
+        try:
+            audio_queue.put_nowait(indata.copy())
+        except queue.Full as error:
+            self._callback_error = RuntimeError("audio queue overflow")
+            raise
+
+    def _stream_finished(self) -> None:
+        if self._stopping or self._stream is None:
+            return
+        if self._stream_error is None:
+            self._stream_error = RuntimeError("audio input stream stopped unexpectedly")
+
+    def _write_audio(
+        self,
+        audio_queue: queue.Queue[Any],
+        sound_file,
+        channel_indices: tuple[int, ...],
+    ) -> None:
+        while True:
+            block = audio_queue.get()
+            if block is STOP_WRITER:
+                return
+
+            try:
+                sound_file.write(block[:, channel_indices])
+            except BaseException as error:
+                self._writer_error = error
+                return
+
+    @staticmethod
+    def _request_writer_stop(audio_queue: queue.Queue[Any]) -> None:
+        try:
+            audio_queue.put_nowait(STOP_WRITER)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+        audio_queue.put_nowait(STOP_WRITER)
+
+    def _next_recording_path(self) -> Path:
+        for _ in range(100):
+            suffix = "-".join(_random_words())
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path = self._config.directory / f"{timestamp}_{suffix}{RECORDING_EXTENSION}"
+            if not path.exists():
+                return path
+        raise RuntimeError("could not create a unique recording filename")
+
+    def _log(self, message: str) -> None:
+        if self._debug is not None:
+            self._debug(message)
+
+
+def list_audio_input_devices() -> list[str]:
+    sd, _ = _load_audio_modules()
+    with _quiet_backend_stderr():
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    lines = []
+    for index, device in enumerate(devices):
+        input_channels = int(device.get("max_input_channels", 0))
+        if input_channels > 0:
+            hostapi = hostapis[int(device["hostapi"])]["name"]
+            status = _recording_device_status(device, hostapis)
+            lines.append(f"{index}: {device['name']} ({input_channels} inputs, {hostapi}) [{status}]")
+    return lines
+
+
+def default_recording_directory() -> Path:
+    if sys.platform == "win32":
+        return Path.home() / "Music" / DEFAULT_RECORDING_DIR_NAME
+    return Path.home() / DEFAULT_RECORDING_DIR_NAME
+
+
+def reveal_recording(path: Path, debug: DebugLogger | None = None) -> None:
+    try:
+        if sys.platform == "win32":
+            _popen(["explorer", f"/select,{path}"])
+            return
+        if sys.platform == "darwin":
+            _popen(["open", "-R", str(path)])
+            return
+        if _reveal_linux_file(path):
+            return
+        _popen(["xdg-open", str(path.parent)])
+    except Exception as error:
+        if debug is not None:
+            debug(f"Could not reveal recording {path}: {error}")
+
+
+def _reveal_linux_file(path: Path) -> bool:
+    uri = path.resolve().as_uri()
+    try:
+        _popen(
+            [
+                "dbus-send",
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                f"array:string:{uri}",
+                "string:",
+            ]
+        )
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _popen(command: list[str]) -> None:
+    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _pick_input_device(
+    sd,
+    requested_name: str,
+    requested_hostapi: str | None,
+    channels: int | None,
+) -> tuple[int | None, int]:
+    with _quiet_backend_stderr():
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+
+    requested = requested_name.strip()
+    if requested.isdigit():
+        index = int(requested)
+        try:
+            device = devices[index]
+        except IndexError as error:
+            raise RuntimeError(f"No audio input device with index {index}") from error
+        if not _hostapi_matches(device, hostapis, requested_hostapi):
+            hostapi = hostapis[int(device["hostapi"])]["name"]
+            raise RuntimeError(
+                f"Audio device {index} uses {hostapi}, but {requested_hostapi} is required"
+            )
+        return index, _capture_channel_count(index, device, channels)
+
+    candidates = [
+        (index, device)
+        for index, device in enumerate(devices)
+        if _device_has_enough_inputs(device, channels)
+        and _hostapi_matches(device, hostapis, requested_hostapi)
+    ]
+
+    exact_matches = [
+        index for index, device in candidates if str(device["name"]).lower() == requested.lower()
+    ]
+    if exact_matches:
+        index = _best_device_match(exact_matches, devices, hostapis)
+        return index, _capture_channel_count(index, devices[index], channels)
+
+    requested_lower = requested.lower()
+    matches = [
+        index
+        for index, device in candidates
+        if requested_lower in str(device["name"]).lower()
+        or requested_lower in str(hostapis[int(device["hostapi"])]["name"]).lower()
+    ]
+    if matches:
+        index = _best_device_match(matches, devices, hostapis)
+        return index, _capture_channel_count(index, devices[index], channels)
+
+    available = ", ".join(
+        f"{index}: {device['name']} ({device['max_input_channels']} inputs)"
+        for index, device in candidates
+    )
+    channel_text = (
+        "any input channel count"
+        if channels is None
+        else f"at least {channels} channels"
+    )
+    hostapi_text = (
+        ""
+        if requested_hostapi is None
+        else f" on a host API matching {requested_hostapi!r}"
+    )
+    raise RuntimeError(
+        f"No audio input device matching {requested_name!r}{hostapi_text} with {channel_text}. "
+        f"Available: {available or 'none'}"
+    )
+
+
+def _device_has_enough_inputs(device, channels: int | None) -> bool:
+    max_input_channels = int(device.get("max_input_channels", 0))
+    if channels is None:
+        return max_input_channels > 0
+    return max_input_channels >= channels
+
+
+def _recording_device_status(device, hostapis) -> str:
+    reasons = []
+    if not _hostapi_matches(device, hostapis, DEFAULT_HOSTAPI):
+        reasons.append(f"not {DEFAULT_HOSTAPI}")
+    if not _device_has_enough_inputs(device, DEFAULT_CHANNELS):
+        reasons.append(f"needs {DEFAULT_CHANNELS} inputs")
+    if reasons:
+        return "discarded: " + ", ".join(reasons)
+    return "recording candidate"
+
+
+def _hostapi_matches(device, hostapis, requested_hostapi: str | None) -> bool:
+    if requested_hostapi is None:
+        return True
+    hostapi_name = str(hostapis[int(device["hostapi"])]["name"]).lower()
+    return requested_hostapi.lower() in hostapi_name
+
+
+def _best_device_match(indices: list[int], devices, hostapis) -> int:
+    return max(
+        indices,
+        key=lambda index: (
+            int(devices[index].get("max_input_channels", 0)),
+            -_hostapi_priority(str(hostapis[int(devices[index]["hostapi"])]["name"])),
+            -index,
+        ),
+    )
+
+
+def _hostapi_priority(hostapi_name: str) -> int:
+    lowered = hostapi_name.lower()
+    for priority, preferred in enumerate(HOSTAPI_PRIORITY):
+        if preferred.lower() in lowered:
+            return priority
+    return len(HOSTAPI_PRIORITY)
+
+
+def _capture_channel_count(index: int, device, channels: int | None) -> int:
+    max_input_channels = int(device.get("max_input_channels", 0))
+    if max_input_channels < 1:
+        raise RuntimeError(f"Audio device {index} has no input channels")
+    if channels is None:
+        return max_input_channels
+    if max_input_channels < channels:
+        raise RuntimeError(
+            f"Audio device {index} has {max_input_channels} inputs, but {channels} were requested"
+        )
+    return channels
+
+
+def _describe_input_device(sd, index: int | None) -> str:
+    if index is None:
+        return "default input device"
+    with _quiet_backend_stderr():
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    device = devices[index]
+    hostapi = hostapis[int(device["hostapi"])]["name"]
+    return f"{index}: {device['name']} ({device['max_input_channels']} inputs, {hostapi})"
+
+
+def _random_words() -> tuple[str, ...]:
+    rng = random.SystemRandom()
+    count = rng.randint(2, 3)
+    return tuple(rng.sample(RECORDING_WORDS, count))
+
+
+def _normalize_recorded_channels(
+    active_channels: Sequence[int] | None,
+    capture_channels: int,
+) -> tuple[int, ...]:
+    if active_channels is None:
+        return tuple(range(1, capture_channels + 1))
+
+    recorded_channels: list[int] = []
+    seen: set[int] = set()
+    for channel in active_channels:
+        if not 1 <= channel <= capture_channels:
+            continue
+        if channel in seen:
+            continue
+        recorded_channels.append(channel)
+        seen.add(channel)
+
+    if not recorded_channels:
+        raise RuntimeError("No unmuted channels selected for recording")
+    return tuple(recorded_channels)
+
+
+def _format_channel_list(channels: Sequence[int]) -> str:
+    return "channels " + ", ".join(str(channel) for channel in channels)
+
+
+def _format_error(error: BaseException | None) -> str:
+    if error is None:
+        return "unknown error"
+    text = str(error)
+    if text:
+        return text
+    return error.__class__.__name__
+
+
+def _load_audio_modules():
+    if sys.platform == "win32":
+        os.environ.setdefault("SD_ENABLE_ASIO", "1")
+
+    try:
+        with _quiet_backend_stderr():
+            import sounddevice as sd
+        import soundfile as sf
+    except Exception as error:
+        raise RuntimeError(
+            "Recording requires sounddevice and soundfile. Install project dependencies with uv sync."
+        ) from error
+    return sd, sf
+
+
+@contextmanager
+def _quiet_backend_stderr():
+    if os.environ.get("XR18_AUDIO_BACKEND_DEBUG"):
+        yield
+        return
+
+    try:
+        stderr_fd = sys.stderr.fileno()
+        saved_fd = os.dup(stderr_fd)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except Exception:
+        yield
+        return
+
+    try:
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+    finally:
+        os.dup2(saved_fd, stderr_fd)
+        os.close(saved_fd)
+        os.close(devnull_fd)

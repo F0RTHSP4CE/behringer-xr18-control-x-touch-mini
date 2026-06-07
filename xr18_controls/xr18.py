@@ -1,9 +1,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Protocol
 
 import mido
+
+from xr18_controls.midi_ports import DebugLogger
+from xr18_controls.midi_ports import ReconnectableMidiIO
+
+
+FADER_MIN = 0
+FADER_MAX = 127
+PAN_MIN = 1
+PAN_CENTER = 64
+PAN_MAX = 127
+MUTE_OFF = 0
+MUTE_ON = 127
+MUTE_THRESHOLD = 64
+
+
+class CCLane(IntEnum):
+    FADER = 0
+    MUTE = 1
+    PAN = 2
+
+
+class StripControl(IntEnum):
+    CHANNEL_1 = 0
+    AUX = 16
+    FX_RETURN_1 = 17
+    MAIN = 31
+    DCA_1 = 32
+
+
+CHANNEL_COUNT = 16
+FX_RETURN_COUNT = 4
+DCA_COUNT = 4
 
 
 class XR18Listener(Protocol):
@@ -13,7 +46,31 @@ class XR18Listener(Protocol):
     def on_channel_mute(self, channel: int, muted: bool) -> None:
         ...
 
+    def on_channel_pan(self, channel: int, value: int) -> None:
+        ...
+
+    def on_aux_fader(self, value: int) -> None:
+        ...
+
+    def on_fx_return_fader(self, fx: int, value: int) -> None:
+        ...
+
+    def on_aux_mute(self, muted: bool) -> None:
+        ...
+
+    def on_fx_return_mute(self, fx: int, muted: bool) -> None:
+        ...
+
+    def on_aux_pan(self, value: int) -> None:
+        ...
+
+    def on_fx_return_pan(self, fx: int, value: int) -> None:
+        ...
+
     def on_main_fader(self, value: int) -> None:
+        ...
+
+    def on_dca_fader(self, dca: int, value: int) -> None:
         ...
 
     def on_main_mute(self, muted: bool) -> None:
@@ -27,44 +84,191 @@ class XR18Client(Protocol):
     def set_channel_mute(self, channel: int, muted: bool) -> None:
         ...
 
+    def set_channel_pan(self, channel: int, value: int) -> None:
+        ...
+
+    def set_aux_fader(self, value: int) -> None:
+        ...
+
+    def set_fx_return_fader(self, fx: int, value: int) -> None:
+        ...
+
+    def set_aux_mute(self, muted: bool) -> None:
+        ...
+
+    def set_fx_return_mute(self, fx: int, muted: bool) -> None:
+        ...
+
+    def set_aux_pan(self, value: int) -> None:
+        ...
+
+    def set_fx_return_pan(self, fx: int, value: int) -> None:
+        ...
+
     def set_main_fader(self, value: int) -> None:
         ...
 
+    def set_dca_fader(self, dca: int, value: int) -> None:
+        ...
+
     def set_main_mute(self, muted: bool) -> None:
+        ...
+
+    def close(self) -> None:
         ...
 
 
 @dataclass(frozen=True)
 class XR18Ports:
-    input_name: str
-    output_name: str
+    requested_name: str
 
 
 class MidoXR18Client:
     """MIDO-backed XR18 client using the documented CC lanes."""
 
-    def __init__(self, ports: XR18Ports):
-        self._input = mido.open_input(ports.input_name)
-        self._output = mido.open_output(ports.output_name)
+    def __init__(self, ports: XR18Ports, debug: DebugLogger | None = None):
+        self._io = ReconnectableMidiIO(
+            label="XR18",
+            requested_name=ports.requested_name,
+            debug=debug,
+        )
+
+    @property
+    def connected(self) -> bool:
+        return self._io.connected
+
+    @property
+    def input_port(self):
+        return self._io.input_port
+
+    @property
+    def description(self) -> str:
+        return self._io.description
+
+    def connect(self) -> bool:
+        return self._io.connect()
+
+    def disconnect(self, reason: str | None = None) -> None:
+        self._io.disconnect(reason)
+
+    def check_connection(self) -> None:
+        self._io.check_connection()
 
     def close(self) -> None:
-        self._input.close()
-        self._output.close()
+        self._io.close()
 
-    def send(self, message: mido.Message) -> None:
-        self._output.send(message)
+    def send(self, message: mido.Message) -> bool:
+        return self._io.send(message)
 
     def set_channel_fader(self, channel: int, value: int) -> None:
-        self.send(mido.Message("control_change", channel=0, control=_channel_control(channel), value=_clamp(value)))
+        self.send(_cc(CCLane.FADER, _channel_control(channel), _clamp_fader(value)))
 
     def set_channel_mute(self, channel: int, muted: bool) -> None:
-        self.send(mido.Message("control_change", channel=1, control=_channel_control(channel), value=127 if muted else 0))
+        self.send(_cc(CCLane.MUTE, _channel_control(channel), _mute_value(muted)))
+
+    def set_channel_pan(self, channel: int, value: int) -> None:
+        self.send(_cc(CCLane.PAN, _channel_control(channel), _clamp_pan(value)))
+
+    def set_aux_fader(self, value: int) -> None:
+        self.send(_cc(CCLane.FADER, StripControl.AUX, _clamp_fader(value)))
+
+    def set_fx_return_fader(self, fx: int, value: int) -> None:
+        self.send(_cc(CCLane.FADER, _fx_return_control(fx), _clamp_fader(value)))
+
+    def set_aux_mute(self, muted: bool) -> None:
+        self.send(_cc(CCLane.MUTE, StripControl.AUX, _mute_value(muted)))
+
+    def set_fx_return_mute(self, fx: int, muted: bool) -> None:
+        self.send(_cc(CCLane.MUTE, _fx_return_control(fx), _mute_value(muted)))
+
+    def set_aux_pan(self, value: int) -> None:
+        self.send(_cc(CCLane.PAN, StripControl.AUX, _clamp_pan(value)))
+
+    def set_fx_return_pan(self, fx: int, value: int) -> None:
+        self.send(_cc(CCLane.PAN, _fx_return_control(fx), _clamp_pan(value)))
 
     def set_main_fader(self, value: int) -> None:
-        self.send(mido.Message("control_change", channel=0, control=31, value=_clamp(value)))
+        self.send(_cc(CCLane.FADER, StripControl.MAIN, _clamp_fader(value)))
+
+    def set_dca_fader(self, dca: int, value: int) -> None:
+        self.send(_cc(CCLane.FADER, _dca_control(dca), _clamp_fader(value)))
 
     def set_main_mute(self, muted: bool) -> None:
-        self.send(mido.Message("control_change", channel=1, control=31, value=127 if muted else 0))
+        self.send(_cc(CCLane.MUTE, StripControl.MAIN, _mute_value(muted)))
+
+
+class DemoXR18Client:
+    """In-memory XR18 stand-in for developing without a connected mixer."""
+
+    def __init__(self):
+        self.channel_faders = {channel: FADER_MIN for channel in range(1, CHANNEL_COUNT + 1)}
+        self.channel_mutes = {channel: False for channel in range(1, CHANNEL_COUNT + 1)}
+        self.channel_pans = {channel: PAN_CENTER for channel in range(1, CHANNEL_COUNT + 1)}
+        self.fx_return_faders = {fx: FADER_MIN for fx in range(1, FX_RETURN_COUNT + 1)}
+        self.fx_return_mutes = {fx: False for fx in range(1, FX_RETURN_COUNT + 1)}
+        self.fx_return_pans = {fx: PAN_CENTER for fx in range(1, FX_RETURN_COUNT + 1)}
+        self.aux_fader = FADER_MIN
+        self.aux_muted = False
+        self.aux_pan = PAN_CENTER
+        self.dca_faders = {dca: FADER_MIN for dca in range(1, DCA_COUNT + 1)}
+        self.main_fader = FADER_MIN
+        self.main_muted = False
+
+    def close(self) -> None:
+        pass
+
+    def set_channel_fader(self, channel: int, value: int) -> None:
+        clamped = _clamp_fader(value)
+        self.channel_faders[_channel_control(channel) + 1] = clamped
+        print(f"[demo xr18] channel {channel} fader = {clamped}")
+
+    def set_channel_mute(self, channel: int, muted: bool) -> None:
+        self.channel_mutes[_channel_control(channel) + 1] = muted
+        print(f"[demo xr18] channel {channel} mute = {'on' if muted else 'off'}")
+
+    def set_channel_pan(self, channel: int, value: int) -> None:
+        clamped = _clamp_pan(value)
+        self.channel_pans[_channel_control(channel) + 1] = clamped
+        print(f"[demo xr18] channel {channel} pan = {clamped}")
+
+    def set_aux_fader(self, value: int) -> None:
+        self.aux_fader = _clamp_fader(value)
+        print(f"[demo xr18] aux fader = {self.aux_fader}")
+
+    def set_fx_return_fader(self, fx: int, value: int) -> None:
+        clamped = _clamp_fader(value)
+        self.fx_return_faders[_fx_return_control(fx) - StripControl.AUX] = clamped
+        print(f"[demo xr18] FX {fx} return fader = {clamped}")
+
+    def set_aux_mute(self, muted: bool) -> None:
+        self.aux_muted = muted
+        print(f"[demo xr18] aux mute = {'on' if muted else 'off'}")
+
+    def set_fx_return_mute(self, fx: int, muted: bool) -> None:
+        self.fx_return_mutes[_fx_return_control(fx) - StripControl.AUX] = muted
+        print(f"[demo xr18] FX {fx} return mute = {'on' if muted else 'off'}")
+
+    def set_aux_pan(self, value: int) -> None:
+        self.aux_pan = _clamp_pan(value)
+        print(f"[demo xr18] aux pan = {self.aux_pan}")
+
+    def set_fx_return_pan(self, fx: int, value: int) -> None:
+        clamped = _clamp_pan(value)
+        self.fx_return_pans[_fx_return_control(fx) - StripControl.AUX] = clamped
+        print(f"[demo xr18] FX {fx} return pan = {clamped}")
+
+    def set_main_fader(self, value: int) -> None:
+        self.main_fader = _clamp_fader(value)
+        print(f"[demo xr18] main fader = {self.main_fader}")
+
+    def set_dca_fader(self, dca: int, value: int) -> None:
+        clamped = _clamp_fader(value)
+        self.dca_faders[_dca_control(dca) - StripControl.MAIN] = clamped
+        print(f"[demo xr18] DCA {dca} fader = {clamped}")
+
+    def set_main_mute(self, muted: bool) -> None:
+        self.main_muted = muted
+        print(f"[demo xr18] main mute = {'on' if muted else 'off'}")
 
 
 class XR18MessageRouter:
@@ -77,25 +281,83 @@ class XR18MessageRouter:
         if message.type != "control_change":
             return
 
-        if message.channel == 0:
-            if 0 <= message.control <= 15:
+        if message.channel == CCLane.FADER:
+            if _is_channel_control(message.control):
                 self._listener.on_channel_fader(message.control + 1, message.value)
-            elif message.control == 31:
+            elif message.control == StripControl.AUX:
+                self._listener.on_aux_fader(message.value)
+            elif _is_fx_return_control(message.control):
+                self._listener.on_fx_return_fader(message.control - StripControl.AUX, message.value)
+            elif message.control == StripControl.MAIN:
                 self._listener.on_main_fader(message.value)
+            elif _is_dca_control(message.control):
+                self._listener.on_dca_fader(message.control - StripControl.MAIN, message.value)
             return
 
-        if message.channel == 1:
-            if 0 <= message.control <= 15:
-                self._listener.on_channel_mute(message.control + 1, message.value >= 64)
-            elif message.control == 31:
-                self._listener.on_main_mute(message.value >= 64)
+        if message.channel == CCLane.MUTE:
+            muted = message.value >= MUTE_THRESHOLD
+            if _is_channel_control(message.control):
+                self._listener.on_channel_mute(message.control + 1, muted)
+            elif message.control == StripControl.AUX:
+                self._listener.on_aux_mute(muted)
+            elif _is_fx_return_control(message.control):
+                self._listener.on_fx_return_mute(message.control - StripControl.AUX, muted)
+            elif message.control == StripControl.MAIN:
+                self._listener.on_main_mute(muted)
+            return
+
+        if message.channel == CCLane.PAN:
+            if _is_channel_control(message.control):
+                self._listener.on_channel_pan(message.control + 1, message.value)
+            elif message.control == StripControl.AUX:
+                self._listener.on_aux_pan(message.value)
+            elif _is_fx_return_control(message.control):
+                self._listener.on_fx_return_pan(message.control - StripControl.AUX, message.value)
 
 
 def _channel_control(channel: int) -> int:
-    if not 1 <= channel <= 16:
-        raise ValueError(f"channel must be 1..16, got {channel}")
-    return channel - 1
+    _validate_index("channel", channel, CHANNEL_COUNT)
+    return StripControl.CHANNEL_1 + channel - 1
 
 
-def _clamp(value: int) -> int:
-    return max(0, min(127, value))
+def _dca_control(dca: int) -> int:
+    _validate_index("dca", dca, DCA_COUNT)
+    return StripControl.DCA_1 + dca - 1
+
+
+def _fx_return_control(fx: int) -> int:
+    _validate_index("fx", fx, FX_RETURN_COUNT)
+    return StripControl.FX_RETURN_1 + fx - 1
+
+
+def _cc(lane: CCLane, control: int, value: int) -> mido.Message:
+    return mido.Message("control_change", channel=int(lane), control=int(control), value=value)
+
+
+def _mute_value(muted: bool) -> int:
+    return MUTE_ON if muted else MUTE_OFF
+
+
+def _is_channel_control(control: int) -> bool:
+    return StripControl.CHANNEL_1 <= control < StripControl.CHANNEL_1 + CHANNEL_COUNT
+
+
+def _is_fx_return_control(control: int) -> bool:
+    return StripControl.FX_RETURN_1 <= control < StripControl.FX_RETURN_1 + FX_RETURN_COUNT
+
+
+def _is_dca_control(control: int) -> bool:
+    return StripControl.DCA_1 <= control < StripControl.DCA_1 + DCA_COUNT
+
+
+def _validate_index(name: str, value: int, count: int) -> None:
+    if not 1 <= value <= count:
+        raise ValueError(f"{name} must be 1..{count}, got {value}")
+
+
+def _clamp_fader(value: int) -> int:
+    return max(FADER_MIN, min(FADER_MAX, value))
+
+
+def _clamp_pan(value: int) -> int:
+    return max(PAN_MIN, min(PAN_MAX, value))
