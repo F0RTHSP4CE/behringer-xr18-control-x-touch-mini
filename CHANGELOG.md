@@ -20,7 +20,7 @@
   gate) mode.
 - **State is preserved** when switching modes: the last selected bus/FX index and all
   send-level values are remembered.
-- Knob **pan** (press-and-hold) is disabled for channel targets while in BUS or FX mode.
+- Knob **pan** (press-and-hold) is disabled while in `PROCESSING` mode (buttons 9 and 10 pressed simultaneously); pan remains fully functional in BUS and FX modes.
 - Mute buttons (row 1, buttons 1–8) and the master fader always control the main mix
   regardless of the active mixing mode.
 - Extended `xr18.py` with CC lanes 3–8 (`BUS_1_SEND`–`BUS_6_SEND`) and 9–12
