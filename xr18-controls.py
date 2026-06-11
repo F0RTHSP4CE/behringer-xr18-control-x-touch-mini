@@ -326,7 +326,7 @@ class MixerBridge:
                 return
 
             mode = self._state.mixing_mode
-            if mode in (MixingMode.BUS, MixingMode.FX) and target.kind == MixerTargetKind.CHANNEL:
+            if mode == MixingMode.PROCESSING:
                 return
 
             if down:
