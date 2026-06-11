@@ -24,6 +24,16 @@ class CCLane(IntEnum):
     FADER = 0
     MUTE = 1
     PAN = 2
+    BUS_1_SEND = 3
+    BUS_2_SEND = 4
+    BUS_3_SEND = 5
+    BUS_4_SEND = 6
+    BUS_5_SEND = 7
+    BUS_6_SEND = 8
+    FX_1_SEND = 9
+    FX_2_SEND = 10
+    FX_3_SEND = 11
+    FX_4_SEND = 12
 
 
 class StripControl(IntEnum):
@@ -37,6 +47,8 @@ class StripControl(IntEnum):
 CHANNEL_COUNT = 16
 FX_RETURN_COUNT = 4
 DCA_COUNT = 4
+BUS_SEND_COUNT = 6
+FX_SEND_COUNT = 4
 
 
 class XR18Listener(Protocol):
@@ -76,6 +88,12 @@ class XR18Listener(Protocol):
     def on_main_mute(self, muted: bool) -> None:
         ...
 
+    def on_channel_bus_send(self, channel: int, bus: int, value: int) -> None:
+        ...
+
+    def on_channel_fx_send(self, channel: int, fx: int, value: int) -> None:
+        ...
+
 
 class XR18Client(Protocol):
     def set_channel_fader(self, channel: int, value: int) -> None:
@@ -112,6 +130,12 @@ class XR18Client(Protocol):
         ...
 
     def set_main_mute(self, muted: bool) -> None:
+        ...
+
+    def set_channel_bus_send(self, channel: int, bus: int, value: int) -> None:
+        ...
+
+    def set_channel_fx_send(self, channel: int, fx: int, value: int) -> None:
         ...
 
     def close(self) -> None:
@@ -196,6 +220,12 @@ class MidoXR18Client:
     def set_main_mute(self, muted: bool) -> None:
         self.send(_cc(CCLane.MUTE, StripControl.MAIN, _mute_value(muted)))
 
+    def set_channel_bus_send(self, channel: int, bus: int, value: int) -> None:
+        self.send(_cc(_bus_send_lane(bus), _channel_control(channel), _clamp_fader(value)))
+
+    def set_channel_fx_send(self, channel: int, fx: int, value: int) -> None:
+        self.send(_cc(_fx_send_lane(fx), _channel_control(channel), _clamp_fader(value)))
+
 
 class DemoXR18Client:
     """In-memory XR18 stand-in for developing without a connected mixer."""
@@ -213,6 +243,12 @@ class DemoXR18Client:
         self.dca_faders = {dca: FADER_MIN for dca in range(1, DCA_COUNT + 1)}
         self.main_fader = FADER_MIN
         self.main_muted = False
+        self.channel_bus_sends = {
+            (c, b): FADER_MIN for c in range(1, CHANNEL_COUNT + 1) for b in range(1, BUS_SEND_COUNT + 1)
+        }
+        self.channel_fx_sends = {
+            (c, f): FADER_MIN for c in range(1, CHANNEL_COUNT + 1) for f in range(1, FX_SEND_COUNT + 1)
+        }
 
     def close(self) -> None:
         pass
@@ -270,6 +306,16 @@ class DemoXR18Client:
         self.main_muted = muted
         print(f"[demo xr18] main mute = {'on' if muted else 'off'}")
 
+    def set_channel_bus_send(self, channel: int, bus: int, value: int) -> None:
+        clamped = _clamp_fader(value)
+        self.channel_bus_sends[(channel, bus)] = clamped
+        print(f"[demo xr18] channel {channel} bus {bus} send = {clamped}")
+
+    def set_channel_fx_send(self, channel: int, fx: int, value: int) -> None:
+        clamped = _clamp_fader(value)
+        self.channel_fx_sends[(channel, fx)] = clamped
+        print(f"[demo xr18] channel {channel} fx {fx} send = {clamped}")
+
 
 class XR18MessageRouter:
     """Parses XR18 MIDI feedback and dispatches to a listener."""
@@ -313,6 +359,18 @@ class XR18MessageRouter:
                 self._listener.on_aux_pan(message.value)
             elif _is_fx_return_control(message.control):
                 self._listener.on_fx_return_pan(message.control - StripControl.AUX, message.value)
+            return
+
+        if _is_bus_send_lane(message.channel):
+            bus = message.channel - CCLane.BUS_1_SEND + 1
+            if _is_channel_control(message.control):
+                self._listener.on_channel_bus_send(message.control + 1, bus, message.value)
+            return
+
+        if _is_fx_send_lane(message.channel):
+            fx = message.channel - CCLane.FX_1_SEND + 1
+            if _is_channel_control(message.control):
+                self._listener.on_channel_fx_send(message.control + 1, fx, message.value)
 
 
 def _channel_control(channel: int) -> int:
@@ -328,6 +386,24 @@ def _dca_control(dca: int) -> int:
 def _fx_return_control(fx: int) -> int:
     _validate_index("fx", fx, FX_RETURN_COUNT)
     return StripControl.FX_RETURN_1 + fx - 1
+
+
+def _bus_send_lane(bus: int) -> CCLane:
+    _validate_index("bus", bus, BUS_SEND_COUNT)
+    return CCLane(CCLane.BUS_1_SEND + bus - 1)
+
+
+def _fx_send_lane(fx: int) -> CCLane:
+    _validate_index("fx_send", fx, FX_SEND_COUNT)
+    return CCLane(CCLane.FX_1_SEND + fx - 1)
+
+
+def _is_bus_send_lane(channel: int) -> bool:
+    return CCLane.BUS_1_SEND <= channel < CCLane.BUS_1_SEND + BUS_SEND_COUNT
+
+
+def _is_fx_send_lane(channel: int) -> bool:
+    return CCLane.FX_1_SEND <= channel < CCLane.FX_1_SEND + FX_SEND_COUNT
 
 
 def _cc(lane: CCLane, control: int, value: int) -> mido.Message:
