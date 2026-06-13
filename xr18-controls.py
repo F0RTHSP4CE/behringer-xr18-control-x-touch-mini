@@ -28,11 +28,9 @@ from xr18_controls.xtouch_mini import (
     XTouchMiniPorts,
 )
 from xr18_controls.xr18 import (
-    BUS_SEND_COUNT,
     DemoXR18Client,
     FADER_MAX,
     FADER_MIN,
-    FX_SEND_COUNT,
     MidoXR18Client,
     PAN_CENTER,
     PAN_MAX,
@@ -53,10 +51,6 @@ METER_RING_STEPS = 11
 PAN_RING_STEPS = 10
 MAIN_DCA = 4
 RECORD_BUTTON = 16
-MODE_BUS_BUTTON = 9
-MODE_FX_BUTTON = 10
-_MODE_SELECTOR_BUTTONS: frozenset[int] = frozenset({MODE_BUS_BUTTON, MODE_FX_BUTTON, 11, 12, 13})
-VALID_FX_INDICES = (1, 2, 4)
 INPUT_POLL_INTERVAL = 0.01
 RECONNECT_INTERVAL = 1.0
 CONNECTION_CHECK_INTERVAL = 1.0
@@ -67,13 +61,6 @@ DEFAULT_RECORD_AUDIO_DEVICE = "X-AIR"
 def _validate_index(name: str, value: int, count: int) -> None:
     if not 1 <= value <= count:
         raise ValueError(f"{name} must be 1..{count}, got {value}")
-
-
-class MixingMode(Enum):
-    MASTER = "master"
-    BUS = "bus"
-    FX = "fx"
-    PROCESSING = "processing"
 
 
 class PageId(Enum):
@@ -157,19 +144,6 @@ class AppState:
     knob_step: int = 1
     recording_active: bool = False
     recording_light_on: bool = False
-    mixing_mode: MixingMode = field(default=MixingMode.MASTER)
-    selected_bus: int = 1
-    selected_fx: int = 1
-    bus_sends: dict[tuple[int, int], int] = field(
-        default_factory=lambda: {
-            (b, c): FADER_MIN for b in range(1, BUS_SEND_COUNT + 1) for c in range(1, 17)
-        }
-    )
-    fx_sends: dict[tuple[int, int], int] = field(
-        default_factory=lambda: {
-            (f, c): FADER_MIN for f in range(1, FX_SEND_COUNT + 1) for c in range(1, 17)
-        }
-    )
 
 
 PAGE_DEFINITIONS = {
@@ -289,25 +263,6 @@ class MixerBridge:
             if target is None:
                 return
 
-            mode = self._state.mixing_mode
-            if mode == MixingMode.BUS and target.kind == MixerTargetKind.CHANNEL:
-                bus = self._state.selected_bus
-                key = (bus, target.index)
-                new_value = _clamp_fader(self._state.bus_sends[key] + self._scaled_delta(delta))
-                self._state.bus_sends[key] = new_value
-                self._xr18.set_channel_bus_send(target.index, bus, new_value)
-                self._refresh_knob_bus_send_locked(knob, target.index, bus)
-                return
-
-            if mode == MixingMode.FX and target.kind == MixerTargetKind.CHANNEL:
-                fx = self._state.selected_fx
-                key = (fx, target.index)
-                new_value = _clamp_fader(self._state.fx_sends[key] + self._scaled_delta(delta))
-                self._state.fx_sends[key] = new_value
-                self._xr18.set_channel_fx_send(target.index, fx, new_value)
-                self._refresh_knob_fx_send_locked(knob, target.index, fx)
-                return
-
             state = self._strip_state(target)
             if knob in self._state.pan_knobs:
                 state.pan = _clamp_pan(state.pan + self._scaled_delta(delta))
@@ -323,10 +278,6 @@ class MixerBridge:
         with self._lock:
             target = self._current_page_locked().target_for_control(knob)
             if target is None:
-                return
-
-            mode = self._state.mixing_mode
-            if mode == MixingMode.PROCESSING:
                 return
 
             if down:
@@ -345,16 +296,6 @@ class MixerBridge:
 
         if button == RECORD_BUTTON:
             self._toggle_recording()
-            return
-
-        if button in (MODE_BUS_BUTTON, MODE_FX_BUTTON):
-            with self._lock:
-                self._handle_mode_button_locked(button)
-            return
-
-        if button in _MODE_SELECTOR_BUTTONS:
-            with self._lock:
-                self._handle_bit_selector_button_locked(button)
             return
 
         with self._lock:
@@ -450,22 +391,6 @@ class MixerBridge:
         with self._lock:
             self._state.main.muted = muted
 
-    def on_channel_bus_send(self, channel: int, bus: int, value: int) -> None:
-        with self._lock:
-            self._state.bus_sends[(bus, channel)] = _clamp_fader(value)
-            if self._state.mixing_mode == MixingMode.BUS and self._state.selected_bus == bus:
-                knob = self._visible_knob_for_target_locked(MixerTarget.channel(channel))
-                if knob is not None:
-                    self._refresh_knob_bus_send_locked(knob, channel, bus)
-
-    def on_channel_fx_send(self, channel: int, fx: int, value: int) -> None:
-        with self._lock:
-            self._state.fx_sends[(fx, channel)] = _clamp_fader(value)
-            if self._state.mixing_mode == MixingMode.FX and self._state.selected_fx == fx:
-                knob = self._visible_knob_for_target_locked(MixerTarget.channel(channel))
-                if knob is not None:
-                    self._refresh_knob_fx_send_locked(knob, channel, fx)
-
     def pulse_recording_light(self) -> None:
         result = self._recording.stop_if_failed()
         if result is not None:
@@ -549,14 +474,11 @@ class MixerBridge:
             elif knob in self._state.pan_knobs:
                 self._refresh_knob_pan_locked(knob, target)
             else:
-                self._refresh_knob_for_mode_locked(knob, target)
+                self._refresh_knob_fader_locked(knob, target)
 
         for button in BUTTONS:
             if button == RECORD_BUTTON and self._state.recording_active:
                 self._refresh_record_button_locked()
-                continue
-
-            if button in _MODE_SELECTOR_BUTTONS:
                 continue
 
             target = page.target_for_control(button)
@@ -565,8 +487,6 @@ class MixerBridge:
             else:
                 self._refresh_mute_light_locked(button, target)
 
-        self._refresh_mode_lights_locked()
-
     def _refresh_knob_fader_locked(self, knob: int, target: MixerTarget) -> None:
         level = round(self._strip_state(target).fader * METER_RING_STEPS / FADER_MAX)
         self._xtouch.set_knob_ring(knob, level)
@@ -574,136 +494,6 @@ class MixerBridge:
     def _refresh_knob_pan_locked(self, knob: int, target: MixerTarget) -> None:
         level = round((self._strip_state(target).pan - PAN_MIN) * PAN_RING_STEPS / (PAN_MAX - PAN_MIN)) + 1
         self._xtouch.set_knob_pan_ring(knob, level)
-
-    def _refresh_knob_for_mode_locked(self, knob: int, target: MixerTarget) -> None:
-        mode = self._state.mixing_mode
-        if mode == MixingMode.BUS and target.kind == MixerTargetKind.CHANNEL:
-            self._refresh_knob_bus_send_locked(knob, target.index, self._state.selected_bus)
-        elif mode == MixingMode.FX and target.kind == MixerTargetKind.CHANNEL:
-            self._refresh_knob_fx_send_locked(knob, target.index, self._state.selected_fx)
-        else:
-            self._refresh_knob_fader_locked(knob, target)
-
-    def _refresh_knob_bus_send_locked(self, knob: int, channel: int, bus: int) -> None:
-        level_value = self._state.bus_sends[(bus, channel)]
-        level = round(level_value * METER_RING_STEPS / FADER_MAX)
-        self._xtouch.set_knob_ring(knob, level)
-
-    def _refresh_knob_fx_send_locked(self, knob: int, channel: int, fx: int) -> None:
-        level_value = self._state.fx_sends[(fx, channel)]
-        level = round(level_value * METER_RING_STEPS / FADER_MAX)
-        self._xtouch.set_knob_ring(knob, level)
-
-    def _refresh_mode_lights_locked(self) -> None:
-        mode = self._state.mixing_mode
-        bus_on = mode in (MixingMode.BUS, MixingMode.PROCESSING)
-        fx_on = mode in (MixingMode.FX, MixingMode.PROCESSING)
-        self._xtouch.set_button_light(MODE_BUS_BUTTON, bus_on)
-        self._xtouch.set_button_light(MODE_FX_BUTTON, fx_on)
-        if mode == MixingMode.BUS:
-            bus_val = self._state.selected_bus - 1
-            self._xtouch.set_button_light(11, bool((bus_val >> 2) & 1))
-            self._xtouch.set_button_light(12, bool((bus_val >> 1) & 1))
-            self._xtouch.set_button_light(13, bool(bus_val & 1))
-        elif mode == MixingMode.FX:
-            fx = self._state.selected_fx
-            self._xtouch.set_button_light(11, False)
-            self._xtouch.set_button_light(12, fx == 4)
-            self._xtouch.set_button_light(13, fx in (2, 4))
-        else:
-            self._xtouch.set_button_light(11, False)
-            self._xtouch.set_button_light(12, False)
-            self._xtouch.set_button_light(13, False)
-
-    def _handle_mode_button_locked(self, button: int) -> None:
-        old_mode = self._state.mixing_mode
-        bus_on = old_mode in (MixingMode.BUS, MixingMode.PROCESSING)
-        fx_on = old_mode in (MixingMode.FX, MixingMode.PROCESSING)
-        if button == MODE_BUS_BUTTON:
-            bus_on = not bus_on
-        else:
-            fx_on = not fx_on
-        if bus_on and fx_on:
-            new_mode = MixingMode.PROCESSING
-        elif bus_on:
-            new_mode = MixingMode.BUS
-        elif fx_on:
-            new_mode = MixingMode.FX
-        else:
-            new_mode = MixingMode.MASTER
-        if old_mode != new_mode:
-            self._state.mixing_mode = new_mode
-            self._state.pan_knobs.clear()
-            self._double_taps.clear()
-            self._refresh_mode_lights_locked()
-            self._refresh_page_knobs_locked()
-
-    def _handle_bit_selector_button_locked(self, button: int) -> None:
-        mode = self._state.mixing_mode
-        if mode == MixingMode.BUS:
-            self._handle_bus_bit_button_locked(button)
-        elif mode == MixingMode.FX:
-            self._handle_fx_bit_button_locked(button)
-
-    def _handle_bus_bit_button_locked(self, button: int) -> None:
-        bus_val = self._state.selected_bus - 1
-        bit2 = (bus_val >> 2) & 1
-        bit1 = (bus_val >> 1) & 1
-        bit0 = bus_val & 1
-        if button == 11:
-            bit2 ^= 1
-            if bit2 == 1 and bit1 == 1:
-                bit1 = 0
-        elif button == 12:
-            if bit2 == 1:
-                return
-            bit1 ^= 1
-        elif button == 13:
-            bit0 ^= 1
-        new_bus = (bit2 << 2 | bit1 << 1 | bit0) + 1
-        if 1 <= new_bus <= BUS_SEND_COUNT:
-            old_bus = self._state.selected_bus
-            self._state.selected_bus = new_bus
-            self._refresh_mode_lights_locked()
-            if old_bus != new_bus:
-                self._refresh_page_knobs_locked()
-
-    def _handle_fx_bit_button_locked(self, button: int) -> None:
-        if button == 11:
-            return
-        fx = self._state.selected_fx
-        bit1 = 1 if fx == 4 else 0
-        bit0 = 1 if fx in (2, 4) else 0
-        if button == 12:
-            if bit0 == 0:
-                return
-            bit1 ^= 1
-        elif button == 13:
-            bit0 ^= 1
-            if bit0 == 0 and bit1 == 1:
-                bit1 = 0
-        if bit1 == 1 and bit0 == 1:
-            new_fx = 4
-        elif bit1 == 0 and bit0 == 1:
-            new_fx = 2
-        else:
-            new_fx = 1
-        old_fx = self._state.selected_fx
-        self._state.selected_fx = new_fx
-        self._refresh_mode_lights_locked()
-        if old_fx != new_fx:
-            self._refresh_page_knobs_locked()
-
-    def _refresh_page_knobs_locked(self) -> None:
-        page = self._current_page_locked()
-        for knob in KNOBS:
-            target = page.target_for_control(knob)
-            if target is None:
-                self._xtouch.set_knob_ring(knob, FADER_MIN)
-            elif knob in self._state.pan_knobs:
-                self._refresh_knob_pan_locked(knob, target)
-            else:
-                self._refresh_knob_for_mode_locked(knob, target)
 
     def _refresh_mute_light_locked(self, button: int, target: MixerTarget) -> None:
         self._xtouch.set_button_light(button, not self._strip_state(target).muted)
